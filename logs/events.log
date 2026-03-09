@@ -1,2 +1,5 @@
 2026-03-09 21:58:19,439 [INFO] ddos_detect src_port=11024 dst_port=8000 result=DDoS
 2026-03-09 21:59:06,976 [INFO] ddos_detect client_ip=127.0.0.1 src_port=11024 dst_port=8000 result=DDoS
+2026-03-09 22:18:08,574 [INFO] ddos_detect client_ip=127.0.0.1 src_port=11024 dst_port=8000 result=DDoS
+2026-03-09 22:38:33,830 [INFO] ddos_detect client_ip=127.0.0.1 src_port=11024 dst_port=8000 result=DDoS
+2026-03-09 22:38:57,451 [INFO] ddos_detect client_ip=127.0.0.1 src_port=11024 dst_port=8000 result=DDoS

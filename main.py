@@ -1,11 +1,14 @@
 from pathlib import Path
-from typing import Union
+from typing import Union, Optional
+import json
 import logging
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 import numpy as np
 import joblib
+import redis
 
 app = FastAPI(title="DDoS Detection API")
 
@@ -24,6 +27,35 @@ if not logger.handlers:
     )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+# Redis setup (for real-time streaming to frontend)
+REDIS_URL = "redis://localhost:6379/0"
+redis_client: Optional[redis.Redis]
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    # ping once so we fail fast if Redis is not running
+    redis_client.ping()
+except Exception:
+    redis_client = None
+
+
+def publish_event(event: dict) -> None:
+    """
+    Publish attack events to Redis so the frontend can receive them in real time.
+    Channel: \"attack-events\"
+    """
+    if redis_client is None:
+        return
+    try:
+        payload = {
+            **event,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        redis_client.publish("attack-events", json.dumps(payload))
+    except Exception:
+        # avoid breaking the API if Redis is down
+        logger.exception("Failed to publish event to Redis")
+
 
 # load trained DDoS model
 model = joblib.load("model.pkl")
@@ -116,6 +148,16 @@ def detect(payload: Union[Packet, BruteForceRequest], request: Request):
                 payload.SourcePort,
                 payload.DestPort,
             )
+            publish_event(
+                {
+                    "kind": "ddos",
+                    "client_ip": client_ip,
+                    "src_port": payload.SourcePort,
+                    "dst_port": payload.DestPort,
+                    "attack_detected": True,
+                    "attack_type": "DDoS",
+                },
+            )
             return {
                 "attack_detected": True,
                 "attack_type": "DDoS",
@@ -126,6 +168,16 @@ def detect(payload: Union[Packet, BruteForceRequest], request: Request):
             client_ip,
             payload.SourcePort,
             payload.DestPort,
+        )
+        publish_event(
+            {
+                "kind": "ddos",
+                "client_ip": client_ip,
+                "src_port": payload.SourcePort,
+                "dst_port": payload.DestPort,
+                "attack_detected": False,
+                "attack_type": "Benign",
+            },
         )
         return {
             "attack_detected": False,
@@ -167,6 +219,17 @@ def detect(payload: Union[Packet, BruteForceRequest], request: Request):
             payload.foreign_ip,
             payload.password_count,
         )
+        publish_event(
+            {
+                "kind": "bruteforce",
+                "client_ip": client_ip,
+                "username": payload.username,
+                "foreign_ip": payload.foreign_ip,
+                "password_count": payload.password_count,
+                "attack_detected": True,
+                "attack_type": "BruteForce",
+            },
+        )
         return {
             "attack_detected": True,
             "attack_type": "BruteForce",
@@ -178,6 +241,17 @@ def detect(payload: Union[Packet, BruteForceRequest], request: Request):
         payload.username,
         payload.foreign_ip,
         payload.password_count,
+    )
+    publish_event(
+        {
+            "kind": "bruteforce",
+            "client_ip": client_ip,
+            "username": payload.username,
+            "foreign_ip": payload.foreign_ip,
+            "password_count": payload.password_count,
+            "attack_detected": False,
+            "attack_type": "Benign",
+        },
     )
     return {
         "attack_detected": False,
