@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+.env
+.venv
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Trained models (run train_model.py & train_bruteforce_model.py to regenerate)
+*.pkl
+
+# Large datasets (add yours locally; keep repo small)
+# ddos_dataset.xlsx
+# mixed_dataset.csv
