@@ -1,35 +1,136 @@
 from pathlib import Path
-from typing import Union, Optional
+from typing import Annotated, Union, Optional, Tuple
 import json
 import logging
 from datetime import datetime
+from io import BytesIO
+import base64
+import os
+import shlex
+import subprocess
+import ipaddress
 
-from fastapi import FastAPI, Request
+from fastapi import (
+    FastAPI,
+    Request,
+    Query,
+    Header,
+    HTTPException,
+    Body,
+    File,
+    UploadFile,
+)
 from pydantic import BaseModel
 import numpy as np
 import joblib
 import redis
+from bson import ObjectId
+from pymongo import MongoClient
 
-app = FastAPI(title="DDoS Detection API")
+_OPENAPI_TAGS = [
+    {
+        "name": "Core",
+        "description": "Health checks and API status.",
+    },
+    {
+        "name": "Detection",
+        "description": (
+            "ML-based detection. **`POST /detect`**: classification only. **`POST /automated-actions/detect`**: "
+            "same body + **DDoS → isolate** caller IP, **brute-force attack → block** `foreign_ip` when "
+            "`password_count` ≥ threshold. **`GET /detect/packet-auto`** / **`POST .../upload`**: DDoS from PCAP + isolate on hit."
+        ),
+    },
+    {
+        "name": "Actions",
+        "description": "Block/unblock IPs (in-memory + MongoDB) and list blocked IPs.",
+    },
+    {
+        "name": "MongoDB",
+        "description": "CRUD-style access to `devices`, `alerts`, and `automated_actions` collections.",
+    },
+    {
+        "name": "WiFi logs",
+        "description": (
+            "Read or append WiFi/router log files on disk. Configure `WIFI_LOG_PATH`, "
+            "`WIFI_LOG_DIR`, `WIFI_LOG_INGEST_KEY` via environment variables."
+        ),
+    },
+    {
+        "name": "Stats",
+        "description": "Per-IP request counts and action history (in-memory, resets on server restart).",
+    },
+]
+
+app = FastAPI(
+    title="SOC Security API",
+    version="1.0.0",
+    description="""
+## Overview
+Security operations API: **DDoS** and **brute-force** classification (trained models),
+optional **MongoDB** persistence, **Redis** pub/sub for realtime dashboards, and **WiFi log** file access.
+
+## Swagger UI
+- This page documents every endpoint.
+- **ReDoc**: `/redoc`
+
+## Environment variables (common)
+| Variable | Purpose |
+|----------|---------|
+| `MONGO_URL` | MongoDB connection string (default `mongodb://localhost:27017`) |
+| `MONGO_DB` | Database name (default `soc_security`) |
+| `REDIS_URL` | Redis for `attack-events` channel (default `redis://localhost:6379/0`) |
+| `WIFI_LOG_PATH` | File read by `GET /logs/wifi` |
+| `WIFI_LOG_DIR` | Directory for optional `?file=` basename |
+| `WIFI_LOG_INGEST_KEY` | If set, required header `X-WiFi-Log-Key` for `POST /logs/wifi/append` |
+| `WIFI_AUTO_PACKET_PATH` | PCAP read by **`GET /detect/packet-auto`** (default `logs/wifi_last.pcap`) |
+| `BF_AUTO_BLOCK_THRESHOLD` | Brute-force auto-block when `password_count` ≥ this (default **6**) — see **`POST /automated-actions/detect`** |
+| `ENFORCEMENT_ENABLED` | Run real OS/network action commands for block/isolate (`1`=enabled, default disabled) |
+| `ENFORCE_*_CMD` | Command templates with `{ip}` (e.g. `ENFORCE_BLOCK_CMD`, `ENFORCE_ISOLATE_CMD`) |
+""",
+    openapi_tags=_OPENAPI_TAGS,
+)
 
 # logging setup
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "events.log"
 
+# WiFi logs: point syslog/rsyslog or router export here (see README or env docs)
+WIFI_LOG_PATH = Path(os.getenv("WIFI_LOG_PATH", str(LOG_DIR / "wifi.log")))
+WIFI_LOG_DIR = Path(os.getenv("WIFI_LOG_DIR", str(LOG_DIR)))
+# If set, POST /logs/wifi/append requires header X-WiFi-Log-Key: <value>
+WIFI_LOG_INGEST_KEY = os.getenv("WIFI_LOG_INGEST_KEY", "").strip()
+# GET /detect/packet-auto reads PCAP from this file (e.g. tcpdump -w logs/wifi_last.pcap)
+WIFI_AUTO_PACKET_PATH = Path(
+    os.getenv("WIFI_AUTO_PACKET_PATH", str(LOG_DIR / "wifi_last.pcap")),
+)
+# Brute-force: auto-block foreign_ip when model detects attack and password_count >= this threshold
+BF_AUTO_BLOCK_THRESHOLD = max(1, int(os.getenv("BF_AUTO_BLOCK_THRESHOLD", "6")))
+ENFORCEMENT_ENABLED = os.getenv("ENFORCEMENT_ENABLED", "0").strip() in {"1", "true", "yes"}
+ENFORCE_TIMEOUT_SECONDS = max(1, int(os.getenv("ENFORCE_TIMEOUT_SECONDS", "8")))
+ENFORCE_BLOCK_CMD = os.getenv("ENFORCE_BLOCK_CMD", "").strip()
+ENFORCE_UNBLOCK_CMD = os.getenv("ENFORCE_UNBLOCK_CMD", "").strip()
+ENFORCE_ISOLATE_CMD = os.getenv("ENFORCE_ISOLATE_CMD", "").strip()
+ENFORCE_UNISOLATE_CMD = os.getenv("ENFORCE_UNISOLATE_CMD", "").strip()
+
 logger = logging.getLogger("attack_detector")
 logger.setLevel(logging.INFO)
 
 if not logger.handlers:
     file_handler = logging.FileHandler(LOG_FILE)
+    stream_handler = logging.StreamHandler()
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
     )
     file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
 
 # Redis setup (for real-time streaming to frontend)
 REDIS_URL = "redis://localhost:6379/0"
+ALERT_QUEUE_STREAM = os.getenv("ALERT_QUEUE_STREAM", "security-alerts")
+ALERT_QUEUE_MAXLEN = max(1000, int(os.getenv("ALERT_QUEUE_MAXLEN", "20000")))
 redis_client: Optional[redis.Redis]
 try:
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -38,11 +139,56 @@ try:
 except Exception:
     redis_client = None
 
+# MongoDB setup
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+MONGO_DB = os.getenv("MONGO_DB", "soc_security")
+mongo_client: Optional[MongoClient]
+db = None
+devices_collection = None
+alerts_collection = None
+actions_collection = None
+try:
+    mongo_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=2000)
+    mongo_client.admin.command("ping")
+    db = mongo_client[MONGO_DB]
+    devices_collection = db["devices"]
+    alerts_collection = db["alerts"]
+    actions_collection = db["automated_actions"]
+    logger.info("MongoDB connected successfully: %s/%s", MONGO_URL, MONGO_DB)
+except Exception:
+    mongo_client = None
+    logger.warning("MongoDB not connected. Please start MongoDB on %s", MONGO_URL)
+
+
+def initialize_mongo() -> None:
+    """
+    Ensure DB/collections exist on startup.
+    Mongo creates databases lazily on first write, so we write bootstrap metadata.
+    """
+    if db is None:
+        return
+    now = datetime.utcnow().isoformat()
+    existing = set(db.list_collection_names())
+    for name in ["devices", "alerts", "automated_actions", "app_meta"]:
+        if name not in existing:
+            db.create_collection(name)
+    db["app_meta"].update_one(
+        {"_id": "bootstrap"},
+        {"$set": {"initialized_at": now}},
+        upsert=True,
+    )
+
+
+try:
+    initialize_mongo()
+except Exception:
+    logger.warning("MongoDB schema init skipped (connection unavailable).")
+
 
 def publish_event(event: dict) -> None:
     """
-    Publish attack events to Redis so the frontend can receive them in real time.
-    Channel: \"attack-events\"
+    Publish attack events and actions to Redis so the frontend can receive them in real time.
+    Channel: "attack-events"
     """
     if redis_client is None:
         return
@@ -52,10 +198,199 @@ def publish_event(event: dict) -> None:
             "timestamp": datetime.utcnow().isoformat(),
         }
         redis_client.publish("attack-events", json.dumps(payload))
+        # Durable queue for external automation/action services.
+        redis_client.xadd(
+            ALERT_QUEUE_STREAM,
+            {"event_json": json.dumps(payload)},
+            maxlen=ALERT_QUEUE_MAXLEN,
+            approximate=True,
+        )
     except Exception:
         # avoid breaking the API if Redis is down
         logger.exception("Failed to publish event to Redis")
 
+
+def to_object_id(value: str) -> ObjectId:
+    """Parse string id into Mongo ObjectId."""
+    return ObjectId(value)
+
+
+def serialize_doc(doc: Optional[dict]) -> Optional[dict]:
+    """Convert Mongo document ObjectId fields to strings."""
+    if doc is None:
+        return None
+    payload = dict(doc)
+    payload["id"] = str(payload.pop("_id"))
+    if payload.get("device_id") is not None:
+        payload["device_id"] = str(payload["device_id"])
+    if payload.get("alert_id") is not None:
+        payload["alert_id"] = str(payload["alert_id"])
+    return payload
+
+
+def ensure_device(ip: str) -> Optional[dict]:
+    """Get or create a device record by IP."""
+    if devices_collection is None:
+        return None
+    now = datetime.utcnow().isoformat()
+    devices_collection.update_one(
+        {"ip": ip},
+        {
+            "$setOnInsert": {
+                "ip": ip,
+                "is_blocked": False,
+                "is_isolated": False,
+                "created_at": now,
+                "attack_counts": {"ddos": 0, "brute_force": 0},
+                "total_requests": 0,
+                "last_seen_at": None,
+                "last_detection_type": None,
+            },
+            "$set": {"updated_at": now},
+        },
+        upsert=True,
+    )
+    return devices_collection.find_one({"ip": ip})
+
+
+def upsert_attack_alert(device_id: ObjectId, attack_type: str) -> Optional[dict]:
+    """
+    Upsert an open alert for the device and increment attack counters.
+    attack_type: ddos | brute_force
+    """
+    if alerts_collection is None:
+        return None
+    now = datetime.utcnow().isoformat()
+    inc_field = "attack_counts.ddos" if attack_type == "ddos" else "attack_counts.brute_force"
+    alerts_collection.update_one(
+        {"device_id": device_id, "is_closed": False, "type": "firewall"},
+        {
+            "$setOnInsert": {
+                "title": "Security attack detected",
+                "device_id": device_id,
+                "priority": "high",
+                "type": "firewall",
+                "is_closed": False,
+                "created_at": now,
+            },
+            "$inc": {inc_field: 1},
+            "$set": {"updated_at": now},
+        },
+        upsert=True,
+    )
+    return alerts_collection.find_one(
+        {"device_id": device_id, "is_closed": False, "type": "firewall"},
+    )
+
+
+def create_action_record(
+    action: str,
+    ip: str,
+    reason: Optional[str] = None,
+    status: str = "triggered",
+    device_id: Optional[ObjectId] = None,
+    alert_id: Optional[ObjectId] = None,
+) -> Optional[dict]:
+    """Insert an automated action record into Mongo."""
+    if actions_collection is None:
+        return None
+    doc = {
+        "action": action,
+        "ip": ip,
+        "reason": reason,
+        "status": status,
+        "device_id": device_id,
+        "alert_id": alert_id,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    result = actions_collection.insert_one(doc)
+    return actions_collection.find_one({"_id": result.inserted_id})
+
+
+def record_action(ip: str, action: str, reason: Optional[str] = None) -> None:
+    """Track actions (block/unblock/etc.) taken on a given IP in memory."""
+    entry = {
+        "ip": ip,
+        "action": action,
+        "reason": reason,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    history = IP_ACTIONS.setdefault(ip, [])
+    history.append(entry)
+
+
+def _validate_ip_or_raise(ip: str) -> str:
+    """Reject malformed IP strings before using them in any command."""
+    try:
+        return str(ipaddress.ip_address(ip))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid IP address: {ip}") from exc
+
+
+def run_enforcement_command(action: str, ip: str) -> dict:
+    """
+    Execute real infra command for action (if configured).
+    Set ENFORCEMENT_ENABLED=1 and ENFORCE_*_CMD env vars.
+    """
+    command_by_action = {
+        "block": ENFORCE_BLOCK_CMD,
+        "unblock": ENFORCE_UNBLOCK_CMD,
+        "isolate": ENFORCE_ISOLATE_CMD,
+        "unisolate": ENFORCE_UNISOLATE_CMD,
+    }
+    template = command_by_action.get(action, "")
+    if not ENFORCEMENT_ENABLED:
+        return {
+            "enabled": False,
+            "attempted": False,
+            "applied": False,
+            "message": "ENFORCEMENT_ENABLED is off (state only, no real firewall/network change).",
+        }
+    if not template:
+        return {
+            "enabled": True,
+            "attempted": False,
+            "applied": False,
+            "message": f"Missing command template for action '{action}'.",
+        }
+
+    safe_ip = _validate_ip_or_raise(ip)
+    command = template.format(ip=safe_ip)
+    try:
+        result = subprocess.run(
+            shlex.split(command),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=ENFORCE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.exception("enforce_action_failed action=%s ip=%s", action, safe_ip)
+        return {
+            "enabled": True,
+            "attempted": True,
+            "applied": False,
+            "command": command,
+            "error": str(exc),
+        }
+
+    return {
+        "enabled": True,
+        "attempted": True,
+        "applied": result.returncode == 0,
+        "command": command,
+        "return_code": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+
+
+# in-memory IP tracking and blocklist
+BLOCKED_IPS: set[str] = set()
+ISOLATED_IPS: set[str] = set()
+CLIENT_IPS: set[str] = set()
+CLIENT_IP_COUNTS: dict[str, int] = {}
+IP_ACTIONS: dict[str, list[dict]] = {}
 
 # load trained DDoS model
 model = joblib.load("model.pkl")
@@ -91,6 +426,78 @@ class Packet(BaseModel):
     TCPChecksum: int
 
 
+def parse_raw_bytes_to_packet(raw: bytes) -> Packet:
+    """
+    Build Packet features from raw bytes: PCAP (first frame) or Ethernet/IP frame with TCP.
+    Used by GET /detect/packet-auto and POST /detect/packet-auto/upload.
+    """
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty body")
+    try:
+        from scapy.all import Ether, IP, TCP, rdpcap
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Install scapy: pip install scapy",
+        ) from exc
+
+    pkt = None
+    try:
+        pkts = rdpcap(BytesIO(raw))
+        if pkts:
+            pkt = pkts[0]
+    except Exception:
+        pass
+    if pkt is None:
+        try:
+            e = Ether(raw)
+            if IP in e and TCP in e:
+                pkt = e
+        except Exception:
+            pass
+    if pkt is None:
+        try:
+            ip_only = IP(raw)
+            if IP in ip_only and TCP in ip_only:
+                pkt = ip_only
+        except Exception:
+            pass
+
+    if pkt is None or IP not in pkt or TCP not in pkt:
+        raise HTTPException(
+            status_code=400,
+            detail="Send a PCAP or raw frame with IPv4 + TCP (e.g. tcpdump -w - -c 1)",
+        )
+
+    ip = pkt[IP]
+    tcp = pkt[TCP]
+    ip_total = int(ip.len) if ip.len is not None else len(ip)
+    ip_hlen = int(ip.ihl) * 4
+    tcp_payload_len = len(tcp.payload) if tcp.payload is not None else 0
+    stream = abs(hash((ip.src, ip.dst, int(tcp.sport), int(tcp.dport)))) % (2**31)
+
+    return Packet(
+        IPLength=ip_total,
+        IPHeaderLength=ip_hlen,
+        TTL=int(ip.ttl),
+        Protocol=int(ip.proto),
+        SourcePort=int(tcp.sport),
+        DestPort=int(tcp.dport),
+        SequenceNumber=int(tcp.seq),
+        AckNumber=int(tcp.ack),
+        WindowSize=int(tcp.window),
+        TCPHeaderLength=int(tcp.dataofs) * 4,
+        TCPLength=tcp_payload_len,
+        TCPStream=stream,
+        TCPUrgentPointer=int(tcp.urgptr),
+        IPFlags=int(ip.flags),
+        IPID=int(ip.id),
+        IPchecksum=int(ip.chksum) if ip.chksum is not None else 0,
+        TCPflags=int(tcp.flags),
+        TCPChecksum=int(tcp.chksum) if tcp.chksum is not None else 0,
+    )
+
+
 class BruteForceRequest(BaseModel):
     """Request body for brute-force detection."""
 
@@ -101,94 +508,722 @@ class BruteForceRequest(BaseModel):
     foreign_ip: str
 
 
-@app.get("/")
+class BlockIpRequest(BaseModel):
+    """Action payload for blocking or unblocking an IP."""
+
+    ip: str
+    reason: Optional[str] = None
+
+
+class WiFiLogAppend(BaseModel):
+    """Push live WiFi log lines from a collector script (router/syslog/macOS log stream)."""
+
+    line: Optional[str] = None
+    lines: Optional[list[str]] = None
+
+
+class DeviceCreate(BaseModel):
+    ip: str
+    is_blocked: bool = False
+    is_isolated: bool = False
+
+
+class AlertCreate(BaseModel):
+    title: str
+    device_id: str
+    priority: str
+    type: str  # firewall, siem, ids, manual
+    is_closed: bool = False
+    attack_counts: dict = {"ddos": 0, "brute_force": 0}
+
+
+class AutomatedActionCreate(BaseModel):
+    action: str  # block, unblock, isolate, unisolate
+    ip: str
+    reason: Optional[str] = None
+    status: str = "done"
+    device_id: Optional[str] = None
+    alert_id: Optional[str] = None
+
+
+@app.get(
+    "/actions/blocked-ips",
+    tags=["Actions"],
+    summary="List blocked IPs (memory)",
+    description=(
+        "Returns all IPs currently marked blocked in the **in-memory** set `BLOCKED_IPS`. "
+        "For Mongo-backed device state, use `GET /devices`."
+    ),
+)
+def list_blocked_ips():
+    """Return the current in-memory list of blocked IPs."""
+    return {"blocked_ips": sorted(BLOCKED_IPS)}
+
+
+@app.post(
+    "/devices",
+    tags=["MongoDB"],
+    summary="Create device",
+    description=(
+        "Insert a device document: `ip`, `is_blocked`, `is_isolated`, and zeroed `attack_counts`. "
+        "Usually devices are also created automatically on first `/detect` via `ensure_device`."
+    ),
+)
+def create_device(payload: DeviceCreate):
+    if devices_collection is None:
+        return {"error": "MongoDB is not connected"}
+    now = datetime.utcnow().isoformat()
+    doc = {
+        "ip": payload.ip,
+        "is_blocked": payload.is_blocked,
+        "is_isolated": payload.is_isolated,
+        "attack_counts": {"ddos": 0, "brute_force": 0},
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = devices_collection.insert_one(doc)
+    return serialize_doc(devices_collection.find_one({"_id": result.inserted_id}))
+
+
+@app.get(
+    "/devices",
+    tags=["MongoDB"],
+    summary="List devices",
+    description="Returns all documents from the `devices` collection, newest first.",
+)
+def list_devices():
+    if devices_collection is None:
+        return {"error": "MongoDB is not connected"}
+    docs = [serialize_doc(doc) for doc in devices_collection.find().sort("created_at", -1)]
+    return {"devices": docs}
+
+
+@app.post(
+    "/alerts",
+    tags=["MongoDB"],
+    summary="Create alert",
+    description=(
+        "Insert an alert linked to a device (`device_id` as Mongo ObjectId string). "
+        "Open firewall-style alerts are also upserted automatically when attacks are detected."
+    ),
+)
+def create_alert(payload: AlertCreate):
+    if alerts_collection is None:
+        return {"error": "MongoDB is not connected"}
+    now = datetime.utcnow().isoformat()
+    doc = {
+        "title": payload.title,
+        "device_id": to_object_id(payload.device_id),
+        "priority": payload.priority,
+        "type": payload.type,
+        "is_closed": payload.is_closed,
+        "attack_counts": payload.attack_counts,
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = alerts_collection.insert_one(doc)
+    return serialize_doc(alerts_collection.find_one({"_id": result.inserted_id}))
+
+
+@app.get(
+    "/alerts",
+    tags=["MongoDB"],
+    summary="List alerts",
+    description="Returns all documents from the `alerts` collection, newest first.",
+)
+def list_alerts():
+    if alerts_collection is None:
+        return {"error": "MongoDB is not connected"}
+    docs = [serialize_doc(doc) for doc in alerts_collection.find().sort("created_at", -1)]
+    return {"alerts": docs}
+
+
+@app.post(
+    "/automated-actions",
+    tags=["MongoDB"],
+    summary="Create automated action",
+    description=(
+        "Manually insert a row in `automated_actions`. Block/unblock from `/actions/*` also writes here."
+    ),
+)
+def create_automated_action(payload: AutomatedActionCreate):
+    if actions_collection is None:
+        return {"error": "MongoDB is not connected"}
+    now = datetime.utcnow().isoformat()
+    doc = {
+        "action": payload.action,
+        "ip": payload.ip,
+        "reason": payload.reason,
+        "status": payload.status,
+        "device_id": to_object_id(payload.device_id) if payload.device_id else None,
+        "alert_id": to_object_id(payload.alert_id) if payload.alert_id else None,
+        "created_at": now,
+    }
+    result = actions_collection.insert_one(doc)
+    return serialize_doc(actions_collection.find_one({"_id": result.inserted_id}))
+
+
+@app.get(
+    "/automated-actions",
+    tags=["MongoDB"],
+    summary="List automated actions",
+    description="Returns all documents from `automated_actions`, newest first.",
+)
+def list_automated_actions():
+    if actions_collection is None:
+        return {"error": "MongoDB is not connected"}
+    docs = [serialize_doc(doc) for doc in actions_collection.find().sort("created_at", -1)]
+    return {"automated_actions": docs}
+
+
+@app.post(
+    "/actions/block-ip",
+    tags=["Actions"],
+    summary="Block IP",
+    description=(
+        "Adds IP to in-memory block list, updates Mongo `devices.is_blocked`, inserts "
+        "`automated_actions`, logs, and publishes Redis `attack-events`. "
+        "If `ENFORCEMENT_ENABLED=1`, executes real command `ENFORCE_BLOCK_CMD`."
+    ),
+)
+def block_ip(action: BlockIpRequest):
+    """Block IP in app state and optionally enforce real infra command."""
+    safe_ip = _validate_ip_or_raise(action.ip)
+    BLOCKED_IPS.add(safe_ip)
+    logger.info("block_ip ip=%s reason=%s", safe_ip, action.reason)
+    record_action(safe_ip, "block", action.reason)
+    enforcement = run_enforcement_command("block", safe_ip)
+    device_doc = ensure_device(safe_ip)
+    if devices_collection is not None:
+        devices_collection.update_one(
+            {"ip": safe_ip},
+            {"$set": {"is_blocked": True, "updated_at": datetime.utcnow().isoformat()}},
+        )
+    if actions_collection is not None:
+        action_doc = {
+            "action": "block",
+            "ip": safe_ip,
+            "reason": action.reason,
+            "status": (
+                "done" if (not enforcement["attempted"] or enforcement["applied"]) else "failed"
+            ),
+            "device_id": device_doc["_id"] if device_doc else None,
+            "alert_id": None,
+            "created_at": datetime.utcnow().isoformat(),
+            "enforcement": enforcement,
+        }
+        actions_collection.insert_one(action_doc)
+    publish_event(
+        {
+            "kind": "action",
+            "action": "block",
+            "ip": safe_ip,
+            "reason": action.reason,
+            "enforcement_applied": enforcement.get("applied", False),
+        },
+    )
+    return {"ip": safe_ip, "blocked": True, "reason": action.reason, "enforcement": enforcement}
+
+
+@app.post(
+    "/actions/unblock-ip",
+    tags=["Actions"],
+    summary="Unblock IP",
+    description=(
+        "Removes IP from in-memory block list, sets `devices.is_blocked=false`, records action, "
+        "and publishes Redis event."
+    ),
+)
+def unblock_ip(action: BlockIpRequest):
+    """Remove an IP address from the block list."""
+    safe_ip = _validate_ip_or_raise(action.ip)
+    BLOCKED_IPS.discard(safe_ip)
+    logger.info("unblock_ip ip=%s reason=%s", safe_ip, action.reason)
+    record_action(safe_ip, "unblock", action.reason)
+    enforcement = run_enforcement_command("unblock", safe_ip)
+    device_doc = ensure_device(safe_ip)
+    if devices_collection is not None:
+        devices_collection.update_one(
+            {"ip": safe_ip},
+            {"$set": {"is_blocked": False, "updated_at": datetime.utcnow().isoformat()}},
+        )
+    if actions_collection is not None:
+        action_doc = {
+            "action": "unblock",
+            "ip": safe_ip,
+            "reason": action.reason,
+            "status": (
+                "done" if (not enforcement["attempted"] or enforcement["applied"]) else "failed"
+            ),
+            "device_id": device_doc["_id"] if device_doc else None,
+            "alert_id": None,
+            "created_at": datetime.utcnow().isoformat(),
+            "enforcement": enforcement,
+        }
+        actions_collection.insert_one(action_doc)
+    publish_event(
+        {
+            "kind": "action",
+            "action": "unblock",
+            "ip": safe_ip,
+            "reason": action.reason,
+            "enforcement_applied": enforcement.get("applied", False),
+        },
+    )
+    return {"ip": safe_ip, "blocked": False, "reason": action.reason, "enforcement": enforcement}
+
+
+@app.post(
+    "/actions/isolate-ip",
+    tags=["Actions"],
+    summary="Isolate IP (network quarantine)",
+    description=(
+        "Marks IP as **isolated** (in-memory `ISOLATED_IPS`, Mongo `devices.is_isolated`), records "
+        "`automated_actions`, and publishes Redis. Use for DDoS-style containment (separate from **block**)."
+    ),
+)
+def isolate_ip(action: BlockIpRequest):
+    """Quarantine an IP in state and optionally enforce real isolation command."""
+    safe_ip = _validate_ip_or_raise(action.ip)
+    ISOLATED_IPS.add(safe_ip)
+    logger.info("isolate_ip ip=%s reason=%s", safe_ip, action.reason)
+    record_action(safe_ip, "isolate", action.reason)
+    enforcement = run_enforcement_command("isolate", safe_ip)
+    device_doc = ensure_device(safe_ip)
+    if devices_collection is not None:
+        devices_collection.update_one(
+            {"ip": safe_ip},
+            {"$set": {"is_isolated": True, "updated_at": datetime.utcnow().isoformat()}},
+        )
+    if actions_collection is not None:
+        actions_collection.insert_one(
+            {
+                "action": "isolate",
+                "ip": safe_ip,
+                "reason": action.reason,
+                "status": (
+                    "done" if (not enforcement["attempted"] or enforcement["applied"]) else "failed"
+                ),
+                "device_id": device_doc["_id"] if device_doc else None,
+                "alert_id": None,
+                "created_at": datetime.utcnow().isoformat(),
+                "enforcement": enforcement,
+            },
+        )
+    publish_event(
+        {
+            "kind": "action",
+            "action": "isolate",
+            "ip": safe_ip,
+            "reason": action.reason,
+            "enforcement_applied": enforcement.get("applied", False),
+        },
+    )
+    return {"ip": safe_ip, "isolated": True, "reason": action.reason, "enforcement": enforcement}
+
+
+@app.post(
+    "/actions/unisolate-ip",
+    tags=["Actions"],
+    summary="Remove IP isolation",
+    description="Clears in-memory isolation and sets `devices.is_isolated=false`.",
+)
+def unisolate_ip(action: BlockIpRequest):
+    safe_ip = _validate_ip_or_raise(action.ip)
+    ISOLATED_IPS.discard(safe_ip)
+    logger.info("unisolate_ip ip=%s reason=%s", safe_ip, action.reason)
+    record_action(safe_ip, "unisolate", action.reason)
+    enforcement = run_enforcement_command("unisolate", safe_ip)
+    device_doc = ensure_device(safe_ip)
+    if devices_collection is not None:
+        devices_collection.update_one(
+            {"ip": safe_ip},
+            {"$set": {"is_isolated": False, "updated_at": datetime.utcnow().isoformat()}},
+        )
+    if actions_collection is not None:
+        actions_collection.insert_one(
+            {
+                "action": "unisolate",
+                "ip": safe_ip,
+                "reason": action.reason,
+                "status": (
+                    "done" if (not enforcement["attempted"] or enforcement["applied"]) else "failed"
+                ),
+                "device_id": device_doc["_id"] if device_doc else None,
+                "alert_id": None,
+                "created_at": datetime.utcnow().isoformat(),
+                "enforcement": enforcement,
+            },
+        )
+    publish_event(
+        {
+            "kind": "action",
+            "action": "unisolate",
+            "ip": safe_ip,
+            "reason": action.reason,
+            "enforcement_applied": enforcement.get("applied", False),
+        },
+    )
+    return {"ip": safe_ip, "isolated": False, "reason": action.reason, "enforcement": enforcement}
+
+
+@app.get(
+    "/actions/isolated-ips",
+    tags=["Actions"],
+    summary="List isolated IPs (memory)",
+    description="IPs currently marked isolated in the in-memory set `ISOLATED_IPS`.",
+)
+def list_isolated_ips():
+    return {"isolated_ips": sorted(ISOLATED_IPS)}
+
+
+@app.get(
+    "/",
+    tags=["Core"],
+    summary="API root",
+    description="Simple liveness message. Use this to verify the server is up.",
+)
 def root():
     return {"message": "DDoS and Brute-force Detection API Running"}
 
 
-@app.post("/detect")
-def detect(payload: Union[Packet, BruteForceRequest], request: Request):
-    """
-    Single endpoint that can detect either:
-    - DDoS attacks from packet-level features
-    - Brute-force attacks from login attempt features
-    """
+@app.get(
+    "/health/db",
+    tags=["Core"],
+    summary="MongoDB health",
+    description=(
+        "Returns whether MongoDB ping succeeded at startup and which connection string/database are configured."
+    ),
+)
+def db_health():
+    """MongoDB connection status message."""
+    if mongo_client is None:
+        return {
+            "mongo_connected": False,
+            "message": f"MongoDB not connected. Start MongoDB at {MONGO_URL}",
+        }
+    return {
+        "mongo_connected": True,
+        "message": f"MongoDB connected to {MONGO_URL} (db: {MONGO_DB})",
+    }
 
+
+def _safe_wifi_log_path(user_path: Optional[str]) -> Optional[Path]:
+    """Only allow files under WIFI_LOG_DIR to avoid path traversal."""
+    if not user_path:
+        return None
+    base = WIFI_LOG_DIR.resolve()
+    candidate = (base / Path(user_path).name).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return None
+    return candidate
+
+
+@app.get(
+    "/logs/wifi",
+    tags=["WiFi logs"],
+    summary="Read WiFi log file (tail)",
+    description=(
+        "Returns the last `lines` lines from the WiFi log file (default `WIFI_LOG_PATH`, e.g. `./logs/wifi.log`). "
+        "The API does not capture WiFi by itself—something must write to that file (router syslog, `log stream`, "
+        "or `POST /logs/wifi/append`). Optional query `file` is a **basename** under `WIFI_LOG_DIR`."
+    ),
+)
+def get_wifi_logs(
+    lines: int = Query(500, ge=1, le=10000, description="Max lines to return from end of file"),
+    file: Optional[str] = Query(
+        None,
+        description="Basename only, file must live under WIFI_LOG_DIR",
+    ),
+):
+    """
+    Return WiFi-related log lines from a file on disk.
+
+    Configure automatic collection by:
+    - Setting env WIFI_LOG_PATH to your router/syslog export file, or
+    - Writing WiFi logs into WIFI_LOG_DIR (default: ./logs) and optionally pass ?file=wifi.log
+
+    Typical setup: rsyslog or router cron appends to logs/wifi.log.
+    """
+    path = _safe_wifi_log_path(file) if file else WIFI_LOG_PATH.resolve()
+    if file and path is None:
+        return {"error": "invalid file", "lines": [], "path": None}
+
+    if not path.is_file():
+        return {
+            "source": str(path),
+            "exists": False,
+            "lines": [],
+            "message": "No WiFi log file yet. Set WIFI_LOG_PATH or export router logs to this path.",
+        }
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"error": str(exc), "source": str(path), "lines": []}
+
+    all_lines = text.splitlines()
+    tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
+    return {
+        "source": str(path),
+        "exists": True,
+        "total_lines": len(all_lines),
+        "returned_lines": len(tail),
+        "lines": tail,
+    }
+
+
+@app.get(
+    "/logs/wifi/list",
+    tags=["WiFi logs"],
+    summary="List WiFi log files",
+    description=(
+        "Lists filenames under `WIFI_LOG_DIR` that look like WiFi logs (`wifi` in name or `.log`/`.txt`). "
+        "Includes `default` path hint."
+    ),
+)
+def list_wifi_log_files():
+    """List candidate WiFi log files under WIFI_LOG_DIR (for frontend pickers)."""
+    base = WIFI_LOG_DIR.resolve()
+    if not base.is_dir():
+        return {"dir": str(base), "files": []}
+    names = sorted(
+        p.name
+        for p in base.iterdir()
+        if p.is_file() and ("wifi" in p.name.lower() or p.suffix.lower() in {".log", ".txt"})
+    )
+    return {"dir": str(base), "files": names, "default": str(WIFI_LOG_PATH)}
+
+
+def _check_wifi_ingest_auth(request: Request, x_wifi_log_key: Optional[str]) -> None:
+    if WIFI_LOG_INGEST_KEY:
+        if x_wifi_log_key != WIFI_LOG_INGEST_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-WiFi-Log-Key")
+        return
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(
+            status_code=403,
+            detail="Set WIFI_LOG_INGEST_KEY for remote ingest, or POST only from localhost",
+        )
+
+
+@app.post(
+    "/logs/wifi/append",
+    tags=["WiFi logs"],
+    summary="Append WiFi log lines",
+    description=(
+        "Appends one or more lines to `WIFI_LOG_PATH` with a UTC timestamp prefix. "
+        "If `WIFI_LOG_INGEST_KEY` is set, send header **X-WiFi-Log-Key**. If not set, only **localhost** may POST. "
+        "Body: `{\"line\": \"...\"}` or `{\"lines\": [\"...\", \"...\"]}`."
+    ),
+)
+def append_wifi_logs(
+    payload: WiFiLogAppend,
+    request: Request,
+    x_wifi_log_key: Optional[str] = Header(None, alias="X-WiFi-Log-Key"),
+):
+    """
+    Append live lines to WIFI_LOG_PATH so GET /logs/wifi shows real-time data.
+
+    Use a small script on the same machine (or router syslog → file) to push lines here.
+    If WIFI_LOG_INGEST_KEY is set, send header: X-WiFi-Log-Key: <key>
+    """
+    _check_wifi_ingest_auth(request, x_wifi_log_key)
+    to_write: list[str] = []
+    if payload.lines:
+        to_write.extend([ln for ln in payload.lines if ln is not None])
+    if payload.line:
+        to_write.append(payload.line)
+    if not to_write:
+        raise HTTPException(status_code=422, detail="Provide line or lines")
+
+    path = WIFI_LOG_PATH.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().isoformat()
+    block = "".join(f"{stamp} {ln}\n" for ln in to_write)
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(block)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {"appended": len(to_write), "path": str(path)}
+
+
+def load_packet_bytes_from_wifi_auto() -> bytes:
+    """
+    For GET /detect/packet-auto: load PCAP/raw bytes written by WiFi automation.
+
+    1) Read file at WIFI_AUTO_PACKET_PATH (default logs/wifi_last.pcap) if it exists and non-empty.
+    2) Else scan last lines of WIFI_LOG_PATH for a line starting with B64: or PCAP64: (base64 PCAP/frame).
+    """
+    pcap_path = WIFI_AUTO_PACKET_PATH.resolve()
+    if pcap_path.is_file() and pcap_path.stat().st_size > 0:
+        return pcap_path.read_bytes()
+
+    log_path = WIFI_LOG_PATH.resolve()
+    if log_path.is_file():
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for line in reversed(text.splitlines()[-800:]):
+            s = line.strip()
+            if s.startswith("B64:"):
+                try:
+                    return base64.b64decode(s[4:].strip())
+                except Exception:
+                    continue
+            if s.startswith("PCAP64:"):
+                try:
+                    return base64.b64decode(s[7:].strip())
+                except Exception:
+                    continue
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "No packet bytes for GET /detect/packet-auto. Use POST /detect/packet-auto/upload with a .pcap, "
+            f"or write a PCAP to {WIFI_AUTO_PACKET_PATH}, or append to {WIFI_LOG_PATH} a line: "
+            "B64:<base64 of small pcap bytes>."
+        ),
+    )
+
+
+def _preamble_detect_client(request: Request) -> Tuple[str, Optional[dict]]:
+    """Client IP, request counts, and device doc — same bookkeeping as POST /detect."""
     client_ip = request.client.host if request.client else "unknown"
+    CLIENT_IPS.add(client_ip)
+    CLIENT_IP_COUNTS[client_ip] = CLIENT_IP_COUNTS.get(client_ip, 0) + 1
+    device_doc = ensure_device(client_ip)
+    return client_ip, device_doc
 
-    # DDoS path: body matches Packet schema
-    if isinstance(payload, Packet):
-        features = np.array([[
-            payload.IPLength,
-            payload.IPHeaderLength,
-            payload.TTL,
-            payload.Protocol,
-            payload.SourcePort,
-            payload.DestPort,
-            payload.SequenceNumber,
-            payload.AckNumber,
-            payload.WindowSize,
-            payload.TCPHeaderLength,
-            payload.TCPLength,
-            payload.TCPStream,
-            payload.TCPUrgentPointer,
-            payload.IPFlags,
-            payload.IPID,
-            payload.IPchecksum,
-            payload.TCPflags,
-            payload.TCPChecksum,
-        ]])
 
-        prediction = model.predict(features)[0]
+def detect_ddos_from_packet(
+    packet: Packet,
+    client_ip: str,
+    device_doc: Optional[dict],
+) -> dict:
+    """
+    DDoS model + Mongo/Redis/actions — same behavior as POST /detect with a JSON Packet body.
+    Used by GET /detect/packet-auto and POST /detect/packet-auto/upload.
+    """
+    features = np.array([[
+        packet.IPLength,
+        packet.IPHeaderLength,
+        packet.TTL,
+        packet.Protocol,
+        packet.SourcePort,
+        packet.DestPort,
+        packet.SequenceNumber,
+        packet.AckNumber,
+        packet.WindowSize,
+        packet.TCPHeaderLength,
+        packet.TCPLength,
+        packet.TCPStream,
+        packet.TCPUrgentPointer,
+        packet.IPFlags,
+        packet.IPID,
+        packet.IPchecksum,
+        packet.TCPflags,
+        packet.TCPChecksum,
+    ]])
 
-        if prediction == 1:
-            logger.info(
-                "ddos_detect client_ip=%s src_port=%s dst_port=%s result=DDoS",
-                client_ip,
-                payload.SourcePort,
-                payload.DestPort,
-            )
-            publish_event(
+    prediction = model.predict(features)[0]
+    if device_doc is not None and devices_collection is not None:
+        devices_collection.update_one(
+            {"_id": device_doc["_id"]},
+            {
+                "$inc": {"total_requests": 1},
+                "$set": {
+                    "last_seen_at": datetime.utcnow().isoformat(),
+                    "last_detection_type": "DDoS",
+                },
+            },
+        )
+
+    if prediction == 1:
+        alert_doc = None
+        if device_doc is not None and devices_collection is not None and alerts_collection is not None:
+            devices_collection.update_one(
+                {"_id": device_doc["_id"]},
                 {
-                    "kind": "ddos",
-                    "client_ip": client_ip,
-                    "src_port": payload.SourcePort,
-                    "dst_port": payload.DestPort,
-                    "attack_detected": True,
-                    "attack_type": "DDoS",
+                    "$inc": {"attack_counts.ddos": 1},
+                    "$set": {"updated_at": datetime.utcnow().isoformat()},
                 },
             )
-            return {
-                "attack_detected": True,
-                "attack_type": "DDoS",
-            }
-
+            alert_doc = upsert_attack_alert(device_doc["_id"], "ddos")
+            create_action_record(
+                action="auto_detect_ddos",
+                ip=client_ip,
+                reason="DDoS attack detected",
+                status="triggered",
+                device_id=device_doc["_id"],
+                alert_id=alert_doc["_id"] if alert_doc else None,
+            )
         logger.info(
-            "ddos_detect client_ip=%s src_port=%s dst_port=%s result=Benign",
+            "ddos_detect client_ip=%s src_port=%s dst_port=%s result=DDoS",
             client_ip,
-            payload.SourcePort,
-            payload.DestPort,
+            packet.SourcePort,
+            packet.DestPort,
         )
         publish_event(
             {
                 "kind": "ddos",
                 "client_ip": client_ip,
-                "src_port": payload.SourcePort,
-                "dst_port": payload.DestPort,
-                "attack_detected": False,
-                "attack_type": "Benign",
+                "src_port": packet.SourcePort,
+                "dst_port": packet.DestPort,
+                "attack_detected": True,
+                "attack_type": "DDoS",
+                "device_id": str(device_doc["_id"]) if device_doc else None,
+                "alert_id": str(alert_doc["_id"]) if alert_doc else None,
             },
         )
         return {
-            "attack_detected": False,
-            "attack_type": "Benign",
+            "attack_detected": True,
+            "attack_type": "DDoS",
+            "client_ip": client_ip,
+            "device_id": str(device_doc["_id"]) if device_doc else None,
+            "alert_id": str(alert_doc["_id"]) if alert_doc else None,
         }
 
-    # Brute-force path: body matches BruteForceRequest schema
+    logger.info(
+        "ddos_detect client_ip=%s src_port=%s dst_port=%s result=Benign",
+        client_ip,
+        packet.SourcePort,
+        packet.DestPort,
+    )
+    publish_event(
+        {
+            "kind": "ddos",
+            "client_ip": client_ip,
+            "src_port": packet.SourcePort,
+            "dst_port": packet.DestPort,
+            "attack_detected": False,
+            "attack_type": "Benign",
+        },
+    )
+    return {
+        "attack_detected": False,
+        "attack_type": "Benign",
+        "client_ip": client_ip,
+    }
+
+
+def detect_bruteforce_from_payload(
+    payload: BruteForceRequest,
+    client_ip: str,
+    device_doc: Optional[dict],
+) -> dict:
+    """Brute-force model path (same outputs as POST /detect for BF JSON)."""
     if model_bruteforce is None:
         return {
             "attack_detected": False,
             "attack_type": "Benign",
+            "client_ip": client_ip,
         }
 
     try:
@@ -197,21 +1232,50 @@ def detect(payload: Union[Packet, BruteForceRequest], request: Request):
         u = 0
 
     try:
-        ip = ip_encoder.transform([payload.foreign_ip])[0]
+        ip_enc = ip_encoder.transform([payload.foreign_ip])[0]
     except (ValueError, TypeError):
-        ip = 0
+        ip_enc = 0
 
     features = np.array([[
         u,
         payload.hour,
         payload.day_of_week,
         payload.password_count,
-        ip,
+        ip_enc,
     ]])
 
     prediction = model_bruteforce.predict(features)[0]
+    if device_doc is not None and devices_collection is not None:
+        devices_collection.update_one(
+            {"_id": device_doc["_id"]},
+            {
+                "$inc": {"total_requests": 1},
+                "$set": {
+                    "last_seen_at": datetime.utcnow().isoformat(),
+                    "last_detection_type": "BruteForce",
+                },
+            },
+        )
 
     if prediction == 1:
+        alert_doc = None
+        if device_doc is not None and devices_collection is not None and alerts_collection is not None:
+            devices_collection.update_one(
+                {"_id": device_doc["_id"]},
+                {
+                    "$inc": {"attack_counts.brute_force": 1},
+                    "$set": {"updated_at": datetime.utcnow().isoformat()},
+                },
+            )
+            alert_doc = upsert_attack_alert(device_doc["_id"], "brute_force")
+            create_action_record(
+                action="auto_detect_bruteforce",
+                ip=client_ip,
+                reason="Brute-force attack detected",
+                status="triggered",
+                device_id=device_doc["_id"],
+                alert_id=alert_doc["_id"] if alert_doc else None,
+            )
         logger.info(
             "bruteforce_detect client_ip=%s username=%s ip=%s pwd_count=%s result=BruteForce",
             client_ip,
@@ -228,11 +1292,16 @@ def detect(payload: Union[Packet, BruteForceRequest], request: Request):
                 "password_count": payload.password_count,
                 "attack_detected": True,
                 "attack_type": "BruteForce",
+                "device_id": str(device_doc["_id"]) if device_doc else None,
+                "alert_id": str(alert_doc["_id"]) if alert_doc else None,
             },
         )
         return {
             "attack_detected": True,
             "attack_type": "BruteForce",
+            "client_ip": client_ip,
+            "device_id": str(device_doc["_id"]) if device_doc else None,
+            "alert_id": str(alert_doc["_id"]) if alert_doc else None,
         }
 
     logger.info(
@@ -256,4 +1325,263 @@ def detect(payload: Union[Packet, BruteForceRequest], request: Request):
     return {
         "attack_detected": False,
         "attack_type": "Benign",
+        "client_ip": client_ip,
+    }
+
+
+def apply_ddos_automated_response(client_ip: str, out: dict, enabled: bool) -> dict:
+    if not enabled:
+        return out
+    if out.get("attack_detected") and out.get("attack_type") == "DDoS":
+        isolate_ip(
+            BlockIpRequest(
+                ip=client_ip,
+                reason="Automated policy: DDoS detected — isolate source",
+            ),
+        )
+        return {
+            **out,
+            "automated_action": {"type": "isolate", "ip": client_ip},
+        }
+    return {**out, "automated_action": None}
+
+
+def apply_bruteforce_automated_response(
+    payload: BruteForceRequest,
+    out: dict,
+    enabled: bool,
+) -> dict:
+    if not enabled:
+        return out
+    if not (out.get("attack_detected") and out.get("attack_type") == "BruteForce"):
+        return {**out, "automated_action": None}
+    if payload.password_count < BF_AUTO_BLOCK_THRESHOLD:
+        return {
+            **out,
+            "automated_action": None,
+            "policy_note": (
+                f"Brute-force attack detected but password_count ({payload.password_count}) "
+                f"< threshold ({BF_AUTO_BLOCK_THRESHOLD}); no block"
+            ),
+        }
+    block_ip(
+        BlockIpRequest(
+            ip=payload.foreign_ip,
+            reason=(
+                f"Automated policy: brute-force attack, "
+                f"password_count>={BF_AUTO_BLOCK_THRESHOLD}"
+            ),
+        ),
+    )
+    return {
+        **out,
+        "automated_action": {"type": "block", "ip": payload.foreign_ip},
+    }
+
+
+def run_detection(
+    request: Request,
+    payload: Union[Packet, BruteForceRequest],
+    apply_response_policy: bool,
+) -> dict:
+    """
+    Shared detection: classification only, or + automated response
+    (DDoS → isolate caller IP; brute-force attack → block foreign_ip when password_count >= threshold).
+    """
+    client_ip, device_doc = _preamble_detect_client(request)
+    if isinstance(payload, Packet):
+        out = detect_ddos_from_packet(payload, client_ip, device_doc)
+        return apply_ddos_automated_response(client_ip, out, apply_response_policy)
+    out = detect_bruteforce_from_payload(payload, client_ip, device_doc)
+    return apply_bruteforce_automated_response(payload, out, apply_response_policy)
+
+
+_DETECT_JSON_EXAMPLES = {
+    "ddos_packet_features": {
+        "summary": "DDoS — 18 packet fields",
+        "description": (
+            "JSON object with all packet feature fields. Same as training CSV columns for DDoS. "
+            "Use **Try it out** → pick this example from the dropdown."
+        ),
+        "value": {
+            "IPLength": 40,
+            "IPHeaderLength": 20,
+            "TTL": 62,
+            "Protocol": 6,
+            "SourcePort": 11024,
+            "DestPort": 8000,
+            "SequenceNumber": 160752180,
+            "AckNumber": 260351565,
+            "WindowSize": 512,
+            "TCPHeaderLength": 20,
+            "TCPLength": 0,
+            "TCPStream": 32891,
+            "TCPUrgentPointer": 0,
+            "IPFlags": 0,
+            "IPID": 27547,
+            "IPchecksum": 30689,
+            "TCPflags": 16,
+            "TCPChecksum": 46656,
+        },
+    },
+    "brute_force_login": {
+        "summary": "Brute-force — login features",
+        "description": (
+            "Different JSON shape (not mixed with DDoS fields). Trained on mixed_dataset-style rows."
+        ),
+        "value": {
+            "username": "root",
+            "hour": 22,
+            "day_of_week": 0,
+            "password_count": 6,
+            "foreign_ip": "42.7.27.166",
+        },
+    },
+}
+
+
+@app.get(
+    "/detect/packet-auto",
+    tags=["Detection"],
+    summary="DDoS detect — WiFi auto PCAP / log (GET, no body)",
+    description=(
+        "**No request body.** Same **DDoS** response and side effects as **`POST /detect`** with packet JSON — "
+        "features come from PCAP, not the request body. Reads bytes from:\n\n"
+        "1. **`WIFI_AUTO_PACKET_PATH`** (default `logs/wifi_last.pcap`).\n"
+        "2. Else newest line in **`WIFI_LOG_PATH`** with **`B64:`** or **`PCAP64:`** + base64 PCAP.\n\n"
+        "Requires **scapy**. To upload a file from Swagger, use **`POST /detect/packet-auto/upload`**."
+    ),
+)
+def detect_packet_auto(request: Request):
+    """Run DDoS model on the last PCAP from WiFi auto file or B64 line in wifi log."""
+    raw = load_packet_bytes_from_wifi_auto()
+    packet = parse_raw_bytes_to_packet(raw)
+    return run_detection(request, packet, apply_response_policy=True)
+
+
+@app.post(
+    "/detect/packet-auto/upload",
+    tags=["Detection"],
+    summary="DDoS detect — upload PCAP (Swagger-friendly)",
+    description=(
+        "Same logic as **`GET /detect/packet-auto`** but accepts **multipart file upload** (Swagger-friendly). "
+        "First packet must be IPv4+TCP."
+    ),
+)
+async def detect_packet_auto_upload(
+    request: Request,
+    file: UploadFile = File(
+        ...,
+        description="Small PCAP from tcpdump/Wireshark, or raw frame with IPv4+TCP",
+    ),
+):
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file")
+    packet = parse_raw_bytes_to_packet(raw)
+    return run_detection(request, packet, apply_response_policy=True)
+
+
+@app.post(
+    "/detect",
+    tags=["Detection"],
+    summary="Detect DDoS (JSON) or brute-force (JSON) — classification only",
+    description=(
+        "**Classification only** (no auto block/isolate). For policy responses use **`POST /automated-actions/detect`**.\n\n"
+        "Open **Request body** and choose an example:\n\n"
+        "- **DDoS**: 18 packet fields.\n"
+        "- **Brute-force**: `username`, `hour`, `day_of_week`, `password_count`, `foreign_ip`.\n\n"
+        "Returns `attack_detected`, `attack_type`, `client_ip`, and when Mongo is connected may include "
+        "`device_id` and `alert_id`."
+    ),
+)
+def detect(
+    request: Request,
+    payload: Annotated[
+        Union[Packet, BruteForceRequest],
+        Body(openapi_examples=_DETECT_JSON_EXAMPLES),
+    ],
+):
+    """
+    Classification only (no automated block/isolate). For policy responses use
+    **`POST /automated-actions/detect`**.
+    """
+    return run_detection(request, payload, apply_response_policy=False)
+
+
+@app.post(
+    "/automated-actions/detect",
+    tags=["Actions"],
+    summary="Detect + automated response (block / isolate)",
+    description=(
+        "Same JSON body as **`POST /detect`** (DDoS packet fields or brute-force login features). "
+        "Runs classification **and** applies policy:\n\n"
+        "- **DDoS** (attack): **`POST /actions/isolate-ip`** on the **caller** `client_ip` (HTTP peer).\n"
+        "- **Brute-force** (attack): **`POST /actions/block-ip`** on **`foreign_ip`** when "
+        f"`password_count` ≥ **`{BF_AUTO_BLOCK_THRESHOLD}`** (override with env `BF_AUTO_BLOCK_THRESHOLD`).\n\n"
+        "Response includes `automated_action` (`isolate` / `block` / `null`) when policy ran."
+    ),
+)
+def automated_actions_detect(
+    request: Request,
+    payload: Annotated[
+        Union[Packet, BruteForceRequest],
+        Body(openapi_examples=_DETECT_JSON_EXAMPLES),
+    ],
+):
+    """Detection with automated containment: DDoS → isolate; brute-force → block at threshold."""
+    return run_detection(request, payload, apply_response_policy=True)
+
+
+@app.get(
+    "/stats/client-ips",
+    tags=["Stats"],
+    summary="Unique client IPs",
+    description="All distinct IPs that have called `POST /detect` since process start (in-memory).",
+)
+def list_client_ips():
+    """Return all unique client IPs that have called /detect."""
+    return {"ips": sorted(CLIENT_IPS)}
+
+
+@app.get(
+    "/stats/client-ips/detail",
+    tags=["Stats"],
+    summary="Client IPs with counts and last action",
+    description=(
+        "Per IP: number of `/detect` calls and last block/unblock action from in-memory `IP_ACTIONS`."
+    ),
+)
+def list_client_ips_detail():
+    """Return client IPs with call counts and last action (if any)."""
+    return {
+        "clients": [
+            {
+                "ip": ip,
+                "count": CLIENT_IP_COUNTS.get(ip, 0),
+                "last_action": IP_ACTIONS.get(ip, [])[-1]["action"]
+                if IP_ACTIONS.get(ip)
+                else None,
+            }
+            for ip in sorted(CLIENT_IPS)
+        ],
+    }
+
+
+@app.get(
+    "/stats/ip-actions",
+    tags=["Stats"],
+    summary="Full action history per IP",
+    description="Complete block/unblock history from in-memory `IP_ACTIONS` (not Mongo).",
+)
+def list_ip_actions():
+    """Return full action history (block/unblock) for each IP."""
+    return {
+        "ips": [
+            {
+                "ip": ip,
+                "actions": IP_ACTIONS.get(ip, []),
+            }
+            for ip in sorted(IP_ACTIONS.keys())
+        ],
     }

@@ -23,3 +23,5 @@ __pycache__/
 # Large datasets (add yours locally; keep repo small)
 # ddos_dataset.xlsx
 # mixed_dataset.csv
+
+logs/wifi.log
