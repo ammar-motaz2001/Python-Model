@@ -45,3 +45,42 @@ Command templates must contain `{ip}`.
 - `BF_AUTO_BLOCK_THRESHOLD` (default `6`)
 - `ENFORCEMENT_ENABLED` (`1` to execute real commands)
 - `ENFORCE_BLOCK_CMD`, `ENFORCE_ISOLATE_CMD`, `ENFORCE_TIMEOUT_SECONDS`
+
+## Deploy To Vercel
+
+This repository is configured for Vercel Python runtime using:
+- `vercel.json`
+- `api/index.py` (exports FastAPI `app` from `main.py`)
+
+### 1) Install and login
+
+```bash
+npm i -g vercel
+vercel login
+```
+
+### 2) Link and deploy
+
+```bash
+vercel
+vercel --prod
+```
+
+### 3) Set environment variables in Vercel
+
+Set from dashboard or CLI:
+
+```bash
+vercel env add MONGO_URL
+vercel env add MONGO_DB
+vercel env add REDIS_URL
+vercel env add BF_AUTO_BLOCK_THRESHOLD
+vercel env add WIFI_LOG_INGEST_KEY
+```
+
+### Important notes for serverless deployment
+
+- Vercel filesystem is read-only except `/tmp`. This app writes logs under `/tmp/logs` automatically on Vercel.
+- `automation_service.py` is a long-running worker and should run on a VM/container, not Vercel serverless.
+- Model files (`model.pkl`, `model_bruteforce.pkl`, encoder `.pkl`) are gitignored by default.
+  Make sure they exist in deployment artifacts, otherwise detection endpoints can return `503`.

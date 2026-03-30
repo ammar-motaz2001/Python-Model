@@ -91,8 +91,8 @@ optional **MongoDB** persistence, **Redis** pub/sub for realtime dashboards, and
 )
 
 # logging setup
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = Path(os.getenv("LOG_DIR", "/tmp/logs" if os.getenv("VERCEL") else "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "events.log"
 
 # WiFi logs: point syslog/rsyslog or router export here (see README or env docs)
@@ -393,7 +393,9 @@ CLIENT_IP_COUNTS: dict[str, int] = {}
 IP_ACTIONS: dict[str, list[dict]] = {}
 
 # load trained DDoS model
-model = joblib.load("model.pkl")
+model = None
+if Path("model.pkl").exists():
+    model = joblib.load("model.pkl")
 
 # load brute-force model and encoders if present
 model_bruteforce = None
@@ -1111,6 +1113,15 @@ def detect_ddos_from_packet(
     DDoS model + Mongo/Redis/actions — same behavior as POST /detect with a JSON Packet body.
     Used by GET /detect/packet-auto and POST /detect/packet-auto/upload.
     """
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "DDoS model is not available. Add model.pkl to deployment artifact or "
+                "download it at runtime before calling detection endpoints."
+            ),
+        )
+
     features = np.array([[
         packet.IPLength,
         packet.IPHeaderLength,
@@ -1220,11 +1231,13 @@ def detect_bruteforce_from_payload(
 ) -> dict:
     """Brute-force model path (same outputs as POST /detect for BF JSON)."""
     if model_bruteforce is None:
-        return {
-            "attack_detected": False,
-            "attack_type": "Benign",
-            "client_ip": client_ip,
-        }
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Brute-force model is not available. Add model_bruteforce.pkl and encoder "
+                "files to deployment artifact or download them at runtime."
+            ),
+        )
 
     try:
         u = username_encoder.transform([payload.username])[0]
