@@ -19,9 +19,14 @@ except ImportError:  # optional dep; install with: pip install python-dotenv
         return False
 
 # Load `.env` before any os.getenv-based config. Try app root next to this file, then CWD (uvicorn).
+# Locally: override=True so `.env` wins over an empty `export MONGO_URL=` in the shell.
+# On Vercel: override=False so platform env vars are not replaced by a missing `.env`.
 _env_root = Path(__file__).resolve().parent
-load_dotenv(_env_root / ".env")
-load_dotenv()
+_DOTENV_PATH = _env_root / ".env"
+_on_vercel = bool(os.getenv("VERCEL"))
+_dotenv_override = not _on_vercel
+load_dotenv(_DOTENV_PATH, override=_dotenv_override)
+load_dotenv(override=_dotenv_override)
 
 from fastapi import (
     FastAPI,
@@ -1029,17 +1034,33 @@ def db_health():
     """MongoDB connection status message."""
     if mongo_client is None:
         using_default = MONGO_URL == _DEFAULT_MONGO or not (os.getenv("MONGO_URL") or "").strip()
-        hint = (
-            "Set MONGO_URL in `.env` next to main.py (local) or in Vercel Environment Variables "
-            "(deployed). Use your Atlas `mongodb+srv://...` string."
-            if using_default
-            else "Check Atlas IP Access (0.0.0.0/0 for serverless), user/password, and database name."
-        )
+        if _on_vercel and using_default:
+            hint = (
+                "Vercel does not use your laptop `.env`. Add MONGO_URL (Atlas mongodb+srv://...) "
+                "and MONGO_DB in Vercel → Project → Settings → Environment Variables, then Redeploy."
+            )
+        elif _on_vercel and not using_default:
+            hint = (
+                "MONGO_URL is set but connection failed. In Atlas: Network Access allow 0.0.0.0/0, "
+                "check user/password, and MONGO_DB name."
+            )
+        elif using_default:
+            hint = (
+                "No MONGO_URL in environment. Put Atlas URI in `.env` next to main.py, restart "
+                "uvicorn, or run: docker compose up -d for local mongodb://localhost:27017"
+            )
+        else:
+            hint = (
+                "MONGO_URL is set but connection failed. Check Atlas IP allowlist, credentials, "
+                "and that the host in the URI is correct."
+            )
         out: dict = {
             "mongo_connected": False,
             "message": hint,
             "mongo_url_configured": not using_default,
             "mongo_host_hint": MONGO_URL.split("@")[-1] if "@" in MONGO_URL else MONGO_URL,
+            "runtime": "vercel" if _on_vercel else "local_or_other",
+            "env_file_found": _DOTENV_PATH.is_file(),
         }
         if MONGO_LAST_ERROR:
             out["last_error"] = MONGO_LAST_ERROR
