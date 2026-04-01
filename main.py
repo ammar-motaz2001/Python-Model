@@ -28,6 +28,14 @@ _dotenv_override = not _on_vercel
 load_dotenv(_DOTENV_PATH, override=_dotenv_override)
 load_dotenv(override=_dotenv_override)
 
+# Before numpy/sklearn: avoid fork/OpenMP issues on serverless (Vercel, Lambda).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
+
 from fastapi import (
     FastAPI,
     Request,
@@ -115,6 +123,7 @@ optional **MongoDB** persistence, **Redis** pub/sub for realtime dashboards, and
 | `CORS_ORIGINS` | Comma-separated allowed browser origins (default `*` for open API) |
 | `EVENT_HISTORY_MAXLEN` | Max in-memory realtime events for `GET /events/recent` and `WS /ws/events` |
 | `ROOT_REDIRECT_TO_DOCS` | `1` (default): `GET /` on localhost redirects to `/docs`; set `0` for JSON root |
+| `SOC_DEBUG_ERRORS` | `1`: `POST /detect` returns real error text in `detail` (debug only; disable in prod) |
 | *(local)* | Copy `.env.example` → `.env`; variables are loaded automatically via `python-dotenv`. |
 """,
     openapi_tags=_OPENAPI_TAGS,
@@ -257,11 +266,12 @@ def publish_event(event: dict) -> None:
     if redis_client is None:
         return
     try:
-        redis_client.publish("attack-events", json.dumps(payload))
+        event_json = json.dumps(payload, default=str)
+        redis_client.publish("attack-events", event_json)
         # Durable queue for external automation/action services.
         redis_client.xadd(
             ALERT_QUEUE_STREAM,
-            {"event_json": json.dumps(payload)},
+            {"event_json": event_json},
             maxlen=ALERT_QUEUE_MAXLEN,
             approximate=True,
         )
@@ -1308,7 +1318,14 @@ def detect_ddos_from_packet(
         packet.TCPChecksum,
     ]])
 
-    prediction = model.predict(features)[0]
+    try:
+        prediction = model.predict(features)[0]
+    except Exception as exc:
+        logger.exception("DDoS model.predict failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model inference failed: {exc!s}"[:500],
+        ) from exc
     if device_doc is not None and alerts_collection is not None:
         record_alert_tp_fp(
             device_doc["_id"],
@@ -1428,7 +1445,14 @@ def detect_bruteforce_from_payload(
         ip_enc,
     ]])
 
-    prediction = model_bruteforce.predict(features)[0]
+    try:
+        prediction = model_bruteforce.predict(features)[0]
+    except Exception as exc:
+        logger.exception("Brute-force model.predict failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model inference failed: {exc!s}"[:500],
+        ) from exc
     if device_doc is not None and alerts_collection is not None:
         record_alert_tp_fp(
             device_doc["_id"],
@@ -1697,7 +1721,22 @@ def detect(
     Classification only (no automated block/isolate). For policy responses use
     **`POST /automated-actions/detect`**.
     """
-    return run_detection(request, payload, apply_response_policy=False)
+    try:
+        return run_detection(request, payload, apply_response_policy=False)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("POST /detect failed")
+        if os.getenv("SOC_DEBUG_ERRORS", "").strip().lower() in {"1", "true", "yes"}:
+            raise HTTPException(status_code=500, detail=str(exc)[:800]) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Internal error during detection. On Vercel: check function logs, sklearn/numpy "
+                "versions, and JOBLIB/OMP env. Set SOC_DEBUG_ERRORS=1 temporarily to return "
+                "the error message in this response."
+            ),
+        ) from exc
 
 
 @app.post(
@@ -1721,7 +1760,21 @@ def automated_actions_detect(
     ],
 ):
     """Detection with automated containment: DDoS → isolate; brute-force → block at threshold."""
-    return run_detection(request, payload, apply_response_policy=True)
+    try:
+        return run_detection(request, payload, apply_response_policy=True)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("POST /automated-actions/detect failed")
+        if os.getenv("SOC_DEBUG_ERRORS", "").strip().lower() in {"1", "true", "yes"}:
+            raise HTTPException(status_code=500, detail=str(exc)[:800]) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Internal error during detection. Set SOC_DEBUG_ERRORS=1 on the deployment for "
+                "a detailed message, or inspect server logs."
+            ),
+        ) from exc
 
 
 @app.get(
