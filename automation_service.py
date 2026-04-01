@@ -3,6 +3,11 @@ import json
 import logging
 import os
 import shlex
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 import signal
 import subprocess
 import sys

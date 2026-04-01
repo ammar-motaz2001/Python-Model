@@ -12,6 +12,11 @@ import subprocess
 import ipaddress
 import threading
 
+from dotenv import load_dotenv
+
+# Load project `.env` before any os.getenv-based config (local dev; Vercel uses injected env).
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from fastapi import (
     FastAPI,
     Request,
@@ -97,6 +102,7 @@ optional **MongoDB** persistence, **Redis** pub/sub for realtime dashboards, and
 | `ENFORCE_*_CMD` | Command templates with `{ip}` (e.g. `ENFORCE_BLOCK_CMD`, `ENFORCE_ISOLATE_CMD`) |
 | `CORS_ORIGINS` | Comma-separated allowed browser origins (default `*` for open API) |
 | `EVENT_HISTORY_MAXLEN` | Max in-memory realtime events for `GET /events/recent` and `WS /ws/events` |
+| *(local)* | Copy `.env.example` → `.env`; variables are loaded automatically via `python-dotenv`. |
 """,
     openapi_tags=_OPENAPI_TAGS,
 )
