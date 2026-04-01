@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Annotated, Union, Optional, Tuple
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -9,6 +10,7 @@ import os
 import shlex
 import subprocess
 import ipaddress
+import threading
 
 from fastapi import (
     FastAPI,
@@ -19,7 +21,10 @@ from fastapi import (
     Body,
     File,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
 import joblib
@@ -59,6 +64,10 @@ _OPENAPI_TAGS = [
         "name": "Stats",
         "description": "Per-IP request counts and action history (in-memory, resets on server restart).",
     },
+    {
+        "name": "Realtime",
+        "description": "Dashboard events via GET backlog and WebSocket stream.",
+    },
 ]
 
 app = FastAPI(
@@ -86,8 +95,22 @@ optional **MongoDB** persistence, **Redis** pub/sub for realtime dashboards, and
 | `BF_AUTO_BLOCK_THRESHOLD` | Brute-force auto-block when `password_count` ≥ this (default **6**) — see **`POST /automated-actions/detect`** |
 | `ENFORCEMENT_ENABLED` | Run real OS/network action commands for block/isolate (`1`=enabled, default disabled) |
 | `ENFORCE_*_CMD` | Command templates with `{ip}` (e.g. `ENFORCE_BLOCK_CMD`, `ENFORCE_ISOLATE_CMD`) |
+| `CORS_ORIGINS` | Comma-separated allowed browser origins (default `*` for open API) |
+| `EVENT_HISTORY_MAXLEN` | Max in-memory realtime events for `GET /events/recent` and `WS /ws/events` |
 """,
     openapi_tags=_OPENAPI_TAGS,
+)
+
+_cors_origins = os.getenv("CORS_ORIGINS", "*").strip()
+_cors_list = ["*"] if _cors_origins == "*" else [o.strip() for o in _cors_origins.split(",") if o.strip()]
+# Browsers disallow credentials + wildcard origin; disable credentials when using "*"
+_cors_credentials = _cors_list != ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_list,
+    allow_credentials=_cors_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # logging setup
@@ -128,9 +151,10 @@ if not logger.handlers:
     logger.addHandler(stream_handler)
 
 # Redis setup (for real-time streaming to frontend)
-REDIS_URL = "redis://localhost:6379/0"
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 ALERT_QUEUE_STREAM = os.getenv("ALERT_QUEUE_STREAM", "security-alerts")
 ALERT_QUEUE_MAXLEN = max(1000, int(os.getenv("ALERT_QUEUE_MAXLEN", "20000")))
+EVENT_HISTORY_MAXLEN = max(100, int(os.getenv("EVENT_HISTORY_MAXLEN", "2000")))
 redis_client: Optional[redis.Redis]
 try:
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -158,6 +182,10 @@ try:
 except Exception:
     mongo_client = None
     logger.warning("MongoDB not connected. Please start MongoDB on %s", MONGO_URL)
+
+EVENT_HISTORY: list[dict] = []
+EVENT_SEQUENCE = 0
+EVENT_LOCK = threading.Lock()
 
 
 def initialize_mongo() -> None:
@@ -190,13 +218,21 @@ def publish_event(event: dict) -> None:
     Publish attack events and actions to Redis so the frontend can receive them in real time.
     Channel: "attack-events"
     """
+    global EVENT_SEQUENCE
+    payload = {
+        **event,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    with EVENT_LOCK:
+        EVENT_SEQUENCE += 1
+        payload["seq"] = EVENT_SEQUENCE
+        EVENT_HISTORY.append(payload)
+        if len(EVENT_HISTORY) > EVENT_HISTORY_MAXLEN:
+            del EVENT_HISTORY[: len(EVENT_HISTORY) - EVENT_HISTORY_MAXLEN]
+
     if redis_client is None:
         return
     try:
-        payload = {
-            **event,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
         redis_client.publish("attack-events", json.dumps(payload))
         # Durable queue for external automation/action services.
         redis_client.xadd(
@@ -225,6 +261,9 @@ def serialize_doc(doc: Optional[dict]) -> Optional[dict]:
         payload["device_id"] = str(payload["device_id"])
     if payload.get("alert_id") is not None:
         payload["alert_id"] = str(payload["alert_id"])
+    if payload.get("type") == "firewall":
+        payload.setdefault("true_positive_count", 0)
+        payload.setdefault("false_positive_count", 0)
     return payload
 
 
@@ -272,6 +311,8 @@ def upsert_attack_alert(device_id: ObjectId, attack_type: str) -> Optional[dict]
                 "type": "firewall",
                 "is_closed": False,
                 "created_at": now,
+                "true_positive_count": 0,
+                "false_positive_count": 0,
             },
             "$inc": {inc_field: 1},
             "$set": {"updated_at": now},
@@ -280,6 +321,51 @@ def upsert_attack_alert(device_id: ObjectId, attack_type: str) -> Optional[dict]
     )
     return alerts_collection.find_one(
         {"device_id": device_id, "is_closed": False, "type": "firewall"},
+    )
+
+
+def record_alert_tp_fp(
+    device_id: ObjectId,
+    *,
+    attack_kind: str,
+    prediction: int,
+    password_count: Optional[int] = None,
+) -> None:
+    """
+    Update open firewall alert with model outcome counters.
+
+    - DDoS: TP if model predicts attack (prediction==1); FP if benign.
+    - Brute-force: TP if model predicts attack AND password_count >= BF_AUTO_BLOCK_THRESHOLD
+      (strong signal); otherwise FP (benign, or weak attempt e.g. 2 tries below threshold).
+    """
+    if alerts_collection is None:
+        return
+    if attack_kind == "ddos":
+        is_true_positive = prediction == 1
+    else:
+        is_true_positive = prediction == 1 and (
+            password_count is not None and password_count >= BF_AUTO_BLOCK_THRESHOLD
+        )
+    now = datetime.utcnow().isoformat()
+    inc_field = "true_positive_count" if is_true_positive else "false_positive_count"
+    alerts_collection.update_one(
+        {"device_id": device_id, "is_closed": False, "type": "firewall"},
+        {
+            "$setOnInsert": {
+                "title": "Security attack detected",
+                "device_id": device_id,
+                "priority": "high",
+                "type": "firewall",
+                "is_closed": False,
+                "created_at": now,
+                "attack_counts": {"ddos": 0, "brute_force": 0},
+                "true_positive_count": 0,
+                "false_positive_count": 0,
+            },
+            "$inc": {inc_field: 1},
+            "$set": {"updated_at": now},
+        },
+        upsert=True,
     )
 
 
@@ -631,7 +717,12 @@ def create_alert(payload: AlertCreate):
     "/alerts",
     tags=["MongoDB"],
     summary="List alerts",
-    description="Returns all documents from the `alerts` collection, newest first.",
+    description=(
+        "Returns all documents from the `alerts` collection, newest first. Open "
+        "`firewall` alerts include **`true_positive_count`** and **`false_positive_count`** "
+        "updated on each detect: DDoS TP=model attack, FP=benign; brute-force TP=model attack "
+        f"with `password_count` ≥ **`{BF_AUTO_BLOCK_THRESHOLD}`**, FP otherwise (e.g. low tries)."
+    ),
 )
 def list_alerts():
     if alerts_collection is None:
@@ -1144,6 +1235,12 @@ def detect_ddos_from_packet(
     ]])
 
     prediction = model.predict(features)[0]
+    if device_doc is not None and alerts_collection is not None:
+        record_alert_tp_fp(
+            device_doc["_id"],
+            attack_kind="ddos",
+            prediction=int(prediction),
+        )
     if device_doc is not None and devices_collection is not None:
         devices_collection.update_one(
             {"_id": device_doc["_id"]},
@@ -1258,6 +1355,13 @@ def detect_bruteforce_from_payload(
     ]])
 
     prediction = model_bruteforce.predict(features)[0]
+    if device_doc is not None and alerts_collection is not None:
+        record_alert_tp_fp(
+            device_doc["_id"],
+            attack_kind="brute_force",
+            prediction=int(prediction),
+            password_count=payload.password_count,
+        )
     if device_doc is not None and devices_collection is not None:
         devices_collection.update_one(
             {"_id": device_doc["_id"]},
@@ -1598,3 +1702,96 @@ def list_ip_actions():
             for ip in sorted(IP_ACTIONS.keys())
         ],
     }
+
+
+@app.get(
+    "/events/recent",
+    tags=["Realtime"],
+    summary="Recent realtime events",
+    description=(
+        "Returns recent events from detections/actions. Use for initial dashboard load, "
+        "then subscribe to `WS /ws/events` for live updates."
+    ),
+)
+def get_recent_events(
+    limit: int = Query(100, ge=1, le=2000, description="Number of most recent events"),
+):
+    with EVENT_LOCK:
+        events = EVENT_HISTORY[-limit:]
+        latest_seq = EVENT_SEQUENCE
+    return {
+        "events": events,
+        "count": len(events),
+        "latest_seq": latest_seq,
+    }
+
+
+@app.websocket("/ws/events")
+async def ws_events(websocket: WebSocket):
+    """
+    Realtime event stream for dashboards.
+    Query params:
+    - replay: send last N events on connect (default 50)
+    - since: send events with seq > since, then continue live
+    """
+    await websocket.accept()
+    params = websocket.query_params
+    replay_raw = params.get("replay", "50")
+    since_raw = params.get("since")
+    try:
+        replay = min(max(int(replay_raw), 0), EVENT_HISTORY_MAXLEN)
+    except ValueError:
+        replay = 50
+    since: Optional[int] = None
+    if since_raw is not None:
+        try:
+            since = int(since_raw)
+        except ValueError:
+            since = None
+
+    last_seq_sent = 0
+    with EVENT_LOCK:
+        if since is not None:
+            initial_events = [evt for evt in EVENT_HISTORY if evt.get("seq", 0) > since]
+            last_seq_sent = since
+        else:
+            initial_events = EVENT_HISTORY[-replay:] if replay > 0 else []
+            if initial_events:
+                last_seq_sent = int(initial_events[-1].get("seq", 0))
+            else:
+                last_seq_sent = EVENT_SEQUENCE
+
+    try:
+        await websocket.send_json(
+            {
+                "kind": "system",
+                "type": "connected",
+                "latest_seq": EVENT_SEQUENCE,
+                "replayed": len(initial_events),
+            },
+        )
+        for evt in initial_events:
+            await websocket.send_json(evt)
+            last_seq_sent = int(evt.get("seq", last_seq_sent))
+
+        while True:
+            with EVENT_LOCK:
+                pending = [evt for evt in EVENT_HISTORY if int(evt.get("seq", 0)) > last_seq_sent]
+            for evt in pending:
+                await websocket.send_json(evt)
+                last_seq_sent = int(evt.get("seq", last_seq_sent))
+
+            try:
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                if message.strip().lower() == "ping":
+                    await websocket.send_json(
+                        {
+                            "kind": "system",
+                            "type": "pong",
+                            "timestamp": datetime.utcnow().isoformat(),
+                        },
+                    )
+            except asyncio.TimeoutError:
+                continue
+    except WebSocketDisconnect:
+        return

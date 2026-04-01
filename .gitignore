@@ -25,3 +25,4 @@ __pycache__/
 # mixed_dataset.csv
 
 logs/wifi.log
+logs/events.log

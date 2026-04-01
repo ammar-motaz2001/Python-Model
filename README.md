@@ -36,6 +36,13 @@ export ENFORCE_ISOLATE_CMD='sudo /usr/local/bin/soc-isolate-ip {ip}'
 
 Command templates must contain `{ip}`.
 
+## Alert TP / FP counts (MongoDB `alerts`)
+
+Open firewall alerts track:
+
+- **`true_positive_count`** — DDoS: model predicted attack. Brute-force: model predicted attack **and** `password_count >= BF_AUTO_BLOCK_THRESHOLD`.
+- **`false_positive_count`** — DDoS: model predicted benign. Brute-force: benign prediction, or attack prediction with `password_count` below threshold (e.g. only 2 tries).
+
 ## Useful Env Vars
 
 - `REDIS_URL` (default `redis://localhost:6379/0`)
@@ -84,3 +91,20 @@ vercel env add WIFI_LOG_INGEST_KEY
 - `automation_service.py` is a long-running worker and should run on a VM/container, not Vercel serverless.
 - Model files (`model.pkl`, `model_bruteforce.pkl`, encoder `.pkl`) are gitignored by default.
   Make sure they exist in deployment artifacts, otherwise detection endpoints can return `503`.
+
+## Realtime dashboard (WebSocket)
+
+- `GET /events/recent?limit=100` — recent events for initial load
+- `WS /ws/events` — live stream (`?replay=50` or `?since=<seq>`)
+
+Optional env:
+
+- `EVENT_HISTORY_MAXLEN` (default `2000`) — cap in-memory event buffer
+- `CORS_ORIGINS` (default `*`) — comma-separated origins for browser clients; use your frontend URL in production
+
+### Frontend base URL (example)
+
+`https://python-model-sigma.vercel.app`
+
+- REST: `https://python-model-sigma.vercel.app/events/recent`
+- WebSocket: `wss://python-model-sigma.vercel.app/ws/events?since=0`
