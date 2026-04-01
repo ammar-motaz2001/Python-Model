@@ -5,7 +5,11 @@ import os
 import shlex
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*_args, **_kwargs) -> bool:
+        return False
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 import signal

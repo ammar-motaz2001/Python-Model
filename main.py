@@ -12,7 +12,11 @@ import subprocess
 import ipaddress
 import threading
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional dep; install with: pip install python-dotenv
+    def load_dotenv(*_args, **_kwargs) -> bool:
+        return False
 
 # Load `.env` before any os.getenv-based config. Try app root next to this file, then CWD (uvicorn).
 _env_root = Path(__file__).resolve().parent
@@ -32,6 +36,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 import numpy as np
 import joblib
@@ -104,6 +109,7 @@ optional **MongoDB** persistence, **Redis** pub/sub for realtime dashboards, and
 | `ENFORCE_*_CMD` | Command templates with `{ip}` (e.g. `ENFORCE_BLOCK_CMD`, `ENFORCE_ISOLATE_CMD`) |
 | `CORS_ORIGINS` | Comma-separated allowed browser origins (default `*` for open API) |
 | `EVENT_HISTORY_MAXLEN` | Max in-memory realtime events for `GET /events/recent` and `WS /ws/events` |
+| `ROOT_REDIRECT_TO_DOCS` | `1` (default): `GET /` on localhost redirects to `/docs`; set `0` for JSON root |
 | *(local)* | Copy `.env.example` → `.env`; variables are loaded automatically via `python-dotenv`. |
 """,
     openapi_tags=_OPENAPI_TAGS,
@@ -987,10 +993,28 @@ def list_isolated_ips():
     "/",
     tags=["Core"],
     summary="API root",
-    description="Simple liveness message. Use this to verify the server is up.",
+    description=(
+        "On **localhost** (browser), redirects to **`/docs`** so Swagger opens immediately. "
+        "Set `ROOT_REDIRECT_TO_DOCS=0` to always return JSON. On Vercel, returns JSON with doc links."
+    ),
 )
-def root():
-    return {"message": "DDoS and Brute-force Detection API Running"}
+def root(request: Request):
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    redirect_on = os.getenv("ROOT_REDIRECT_TO_DOCS", "1").strip().lower() not in {"0", "false", "no"}
+    if (
+        redirect_on
+        and not os.getenv("VERCEL")
+        and host in ("localhost", "127.0.0.1", "::1")
+    ):
+        return RedirectResponse(url="/docs", status_code=302)
+    base = str(request.base_url).rstrip("/")
+    return {
+        "message": "DDoS and Brute-force Detection API Running",
+        "docs": f"{base}/docs",
+        "redoc": f"{base}/redoc",
+        "openapi_json": f"{base}/openapi.json",
+        "health_db": f"{base}/health/db",
+    }
 
 
 @app.get(

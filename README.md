@@ -10,6 +10,8 @@
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+**Local Swagger:** open [http://localhost:8000/](http://localhost:8000/) in a browser — it redirects to **`/docs`**. Or go directly to [http://localhost:8000/docs](http://localhost:8000/docs). Set `ROOT_REDIRECT_TO_DOCS=0` in `.env` if you want `GET /` to return JSON instead.
+
 The detector publishes each event to:
 - Redis pub/sub channel: `attack-events` (realtime UI)
 - Redis stream queue: `security-alerts` (durable automation)
