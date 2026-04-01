@@ -14,8 +14,10 @@ import threading
 
 from dotenv import load_dotenv
 
-# Load project `.env` before any os.getenv-based config (local dev; Vercel uses injected env).
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# Load `.env` before any os.getenv-based config. Try app root next to this file, then CWD (uvicorn).
+_env_root = Path(__file__).resolve().parent
+load_dotenv(_env_root / ".env")
+load_dotenv()
 
 from fastapi import (
     FastAPI,
@@ -170,24 +172,29 @@ except Exception:
     redis_client = None
 
 # MongoDB setup
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
-MONGO_DB = os.getenv("MONGO_DB", "soc_security")
+_DEFAULT_MONGO = "mongodb://localhost:27017"
+_mongo_raw = (os.getenv("MONGO_URL") or "").strip()
+MONGO_URL = _mongo_raw if _mongo_raw else _DEFAULT_MONGO
+MONGO_DB = (os.getenv("MONGO_DB") or "soc_security").strip() or "soc_security"
 mongo_client: Optional[MongoClient]
+MONGO_LAST_ERROR: Optional[str] = None
 db = None
 devices_collection = None
 alerts_collection = None
 actions_collection = None
 try:
-    mongo_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=2000)
+    mongo_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=10000)
     mongo_client.admin.command("ping")
     db = mongo_client[MONGO_DB]
     devices_collection = db["devices"]
     alerts_collection = db["alerts"]
     actions_collection = db["automated_actions"]
+    MONGO_LAST_ERROR = None
     logger.info("MongoDB connected successfully: %s/%s", MONGO_URL, MONGO_DB)
-except Exception:
+except Exception as exc:
     mongo_client = None
-    logger.warning("MongoDB not connected. Please start MongoDB on %s", MONGO_URL)
+    MONGO_LAST_ERROR = str(exc).strip()[:300]
+    logger.warning("MongoDB not connected (%s): %s", MONGO_URL.split("@")[-1], MONGO_LAST_ERROR)
 
 EVENT_HISTORY: list[dict] = []
 EVENT_SEQUENCE = 0
@@ -997,13 +1004,26 @@ def root():
 def db_health():
     """MongoDB connection status message."""
     if mongo_client is None:
-        return {
+        using_default = MONGO_URL == _DEFAULT_MONGO or not (os.getenv("MONGO_URL") or "").strip()
+        hint = (
+            "Set MONGO_URL in `.env` next to main.py (local) or in Vercel Environment Variables "
+            "(deployed). Use your Atlas `mongodb+srv://...` string."
+            if using_default
+            else "Check Atlas IP Access (0.0.0.0/0 for serverless), user/password, and database name."
+        )
+        out: dict = {
             "mongo_connected": False,
-            "message": f"MongoDB not connected. Start MongoDB at {MONGO_URL}",
+            "message": hint,
+            "mongo_url_configured": not using_default,
+            "mongo_host_hint": MONGO_URL.split("@")[-1] if "@" in MONGO_URL else MONGO_URL,
         }
+        if MONGO_LAST_ERROR:
+            out["last_error"] = MONGO_LAST_ERROR
+        return out
     return {
         "mongo_connected": True,
-        "message": f"MongoDB connected to {MONGO_URL} (db: {MONGO_DB})",
+        "message": f"MongoDB connected (db: {MONGO_DB})",
+        "mongo_host_hint": MONGO_URL.split("@")[-1] if "@" in MONGO_URL else MONGO_URL,
     }
 
 
