@@ -447,6 +447,36 @@ def _validate_ip_or_raise(ip: str) -> str:
         raise HTTPException(status_code=422, detail=f"Invalid IP address: {ip}") from exc
 
 
+def persist_device_is_isolated(ip: str, isolated: bool) -> None:
+    """Set `devices.is_isolated` by IP (Mongo). Skips invalid IPs and when DB is down."""
+    if devices_collection is None:
+        return
+    try:
+        safe = _validate_ip_or_raise(ip)
+    except HTTPException:
+        return
+    ensure_device(safe)
+    devices_collection.update_one(
+        {"ip": safe},
+        {"$set": {"is_isolated": isolated, "updated_at": datetime.utcnow().isoformat()}},
+    )
+
+
+def persist_device_is_blocked(ip: str, blocked: bool) -> None:
+    """Set `devices.is_blocked` by IP (Mongo). Skips invalid IPs and when DB is down."""
+    if devices_collection is None:
+        return
+    try:
+        safe = _validate_ip_or_raise(ip)
+    except HTTPException:
+        return
+    ensure_device(safe)
+    devices_collection.update_one(
+        {"ip": safe},
+        {"$set": {"is_blocked": blocked, "updated_at": datetime.utcnow().isoformat()}},
+    )
+
+
 def run_enforcement_command(action: str, ip: str) -> dict:
     """
     Execute real infra command for action (if configured).
@@ -1363,6 +1393,12 @@ def detect_ddos_from_packet(
                 device_id=device_doc["_id"],
                 alert_id=alert_doc["_id"] if alert_doc else None,
             )
+        # Dashboard: DDoS → caller IP isolated in Mongo + in-memory set (aligned with isolate-ip)
+        persist_device_is_isolated(client_ip, True)
+        try:
+            ISOLATED_IPS.add(_validate_ip_or_raise(client_ip))
+        except HTTPException:
+            pass
         logger.info(
             "ddos_detect client_ip=%s src_port=%s dst_port=%s result=DDoS",
             client_ip,
@@ -1491,6 +1527,13 @@ def detect_bruteforce_from_payload(
                 device_id=device_doc["_id"],
                 alert_id=alert_doc["_id"] if alert_doc else None,
             )
+        # Brute-force: block attacker IP in Mongo + memory when threshold met (aligned with block-ip)
+        if payload.password_count >= BF_AUTO_BLOCK_THRESHOLD:
+            persist_device_is_blocked(payload.foreign_ip, True)
+            try:
+                BLOCKED_IPS.add(_validate_ip_or_raise(payload.foreign_ip))
+            except HTTPException:
+                pass
         logger.info(
             "bruteforce_detect client_ip=%s username=%s ip=%s pwd_count=%s result=BruteForce",
             client_ip,
@@ -1723,7 +1766,9 @@ async def detect_packet_auto_upload(
         "- **DDoS**: 18 packet fields.\n"
         "- **Brute-force**: `username`, `hour`, `day_of_week`, `password_count`, `foreign_ip`.\n\n"
         "Returns `attack_detected`, `attack_type`, `client_ip`, and when Mongo is connected may include "
-        "`device_id` and `alert_id`."
+        "`device_id` and `alert_id`. When Mongo is connected: **DDoS** sets **`devices.is_isolated=true`** "
+        "for the caller IP; **brute-force attack** sets **`devices.is_blocked=true`** for **`foreign_ip`** "
+        f"when `password_count` ≥ **`{BF_AUTO_BLOCK_THRESHOLD}`** (same as auto-block policy)."
     ),
 )
 def detect(
