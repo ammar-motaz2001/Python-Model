@@ -123,7 +123,7 @@ optional **MongoDB** persistence, **Redis** pub/sub for realtime dashboards, and
 | `CORS_ORIGINS` | Comma-separated allowed browser origins (default `*` for open API) |
 | `EVENT_HISTORY_MAXLEN` | Max in-memory realtime events for `GET /events/recent` and `WS /ws/events` |
 | `ROOT_REDIRECT_TO_DOCS` | `1` (default): `GET /` on localhost redirects to `/docs`; set `0` for JSON root |
-| `SOC_DEBUG_ERRORS` | `1`: `POST /detect` returns real error text in `detail` (debug only; disable in prod) |
+| `SOC_DEBUG_ERRORS` | `0` / `false`: hide raw errors on `POST /detect` (default is to show `ExceptionType: message`) |
 | *(local)* | Copy `.env.example` → `.env`; variables are loaded automatically via `python-dotenv`. |
 """,
     openapi_tags=_OPENAPI_TAGS,
@@ -1611,6 +1611,22 @@ def run_detection(
     return apply_bruteforce_automated_response(payload, out, apply_response_policy)
 
 
+def _detection_failed_http_exception(exc: BaseException) -> HTTPException:
+    """
+    Map unexpected detection errors to HTTP 500.
+    By default the real exception is returned in `detail` (helps Vercel debugging).
+    Set SOC_DEBUG_ERRORS=0 to hide details in production.
+    """
+    if os.getenv("SOC_DEBUG_ERRORS", "").strip().lower() in {"0", "false", "no"}:
+        return HTTPException(
+            status_code=500,
+            detail="Internal error during detection (detail hidden: set SOC_DEBUG_ERRORS unset or 1).",
+        )
+    exc_type = type(exc).__name__
+    msg = str(exc).strip()[:900]
+    return HTTPException(status_code=500, detail=f"{exc_type}: {msg}")
+
+
 _DETECT_JSON_EXAMPLES = {
     "ddos_packet_features": {
         "summary": "DDoS — 18 packet fields",
@@ -1727,16 +1743,7 @@ def detect(
         raise
     except Exception as exc:
         logger.exception("POST /detect failed")
-        if os.getenv("SOC_DEBUG_ERRORS", "").strip().lower() in {"1", "true", "yes"}:
-            raise HTTPException(status_code=500, detail=str(exc)[:800]) from exc
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Internal error during detection. On Vercel: check function logs, sklearn/numpy "
-                "versions, and JOBLIB/OMP env. Set SOC_DEBUG_ERRORS=1 temporarily to return "
-                "the error message in this response."
-            ),
-        ) from exc
+        raise _detection_failed_http_exception(exc) from exc
 
 
 @app.post(
@@ -1766,15 +1773,7 @@ def automated_actions_detect(
         raise
     except Exception as exc:
         logger.exception("POST /automated-actions/detect failed")
-        if os.getenv("SOC_DEBUG_ERRORS", "").strip().lower() in {"1", "true", "yes"}:
-            raise HTTPException(status_code=500, detail=str(exc)[:800]) from exc
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Internal error during detection. Set SOC_DEBUG_ERRORS=1 on the deployment for "
-                "a detailed message, or inspect server logs."
-            ),
-        ) from exc
+        raise _detection_failed_http_exception(exc) from exc
 
 
 @app.get(
