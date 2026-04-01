@@ -4,6 +4,12 @@
 
 `Detector API (main.py)` -> `Redis Stream (security-alerts)` -> `Automation Service (automation_service.py)` -> `Firewall`
 
+## Model accuracy in health API
+
+- **`GET /health`** — Mongo + models (includes **test-set accuracy** per model).
+- **`GET /health/models`** — load status + accuracy only.
+- Metrics live in **`model_metrics.json`** at the repo root. Run **`train_model.py`** (DDoS) and **`train_bruteforce_model.py`** (brute-force) to refresh; commit the updated JSON for Vercel.
+
 ## 1) Run Detector API
 
 ```bash

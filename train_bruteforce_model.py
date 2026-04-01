@@ -2,11 +2,15 @@
 Train brute-force attack detection model (same workflow as DDoS).
 Uses mixed_dataset.csv: username, timestamp, passwords, foreign_ip, Label (0=Benign, 1=Attack).
 """
-import pandas as pd
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
 import joblib
-from datetime import datetime
-from sklearn.model_selection import train_test_split
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 # load dataset
@@ -62,9 +66,29 @@ X_train, X_test, y_train, y_test = train_test_split(
 model = RandomForestClassifier(n_estimators=100)
 model.fit(X_train, y_train)
 
+y_pred = model.predict(X_test)
+accuracy = float(accuracy_score(y_test, y_pred))
+
 joblib.dump(model, "model_bruteforce.pkl")
 joblib.dump(username_enc, "username_encoder.pkl")
 joblib.dump(ip_enc, "ip_encoder.pkl")
 
+metrics_path = Path("model_metrics.json")
+existing: dict = {}
+if metrics_path.is_file():
+    try:
+        existing = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        existing = {}
+existing["brute_force"] = {
+    "accuracy": round(accuracy, 6),
+    "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
+    "n_test_samples": int(len(y_test)),
+    "test_size_fraction": 0.2,
+    "random_state": 42,
+}
+metrics_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+
 print("Brute-force model trained and saved successfully!")
 print(f"Features: {feature_cols}")
+print(f"Test accuracy: {accuracy:.6f} (n_test={len(y_test)})")

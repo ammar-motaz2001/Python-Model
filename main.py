@@ -560,6 +560,44 @@ if _bf_path.is_file():
     ip_encoder = joblib.load(_MODEL_DIR / "ip_encoder.pkl")
 
 
+def _load_model_metrics_file() -> dict:
+    """Test-set metrics from last training run (model_metrics.json)."""
+    path = _MODEL_DIR / "model_metrics.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Could not parse model_metrics.json")
+        return {}
+
+
+MODEL_METRICS: dict = _load_model_metrics_file()
+
+
+def _models_health_payload() -> dict:
+    dd = MODEL_METRICS.get("ddos") if isinstance(MODEL_METRICS.get("ddos"), dict) else {}
+    bf = MODEL_METRICS.get("brute_force") if isinstance(MODEL_METRICS.get("brute_force"), dict) else {}
+    return {
+        "ddos": {
+            "loaded": model is not None,
+            "accuracy": dd.get("accuracy"),
+            "evaluated_at_utc": dd.get("evaluated_at_utc"),
+            "n_test_samples": dd.get("n_test_samples"),
+            "note": dd.get("note"),
+        },
+        "brute_force": {
+            "loaded": model_bruteforce is not None,
+            "accuracy": bf.get("accuracy"),
+            "evaluated_at_utc": bf.get("evaluated_at_utc"),
+            "n_test_samples": bf.get("n_test_samples"),
+            "note": bf.get("note"),
+        },
+        "metrics_source": "model_metrics.json (run train_model.py / train_bruteforce_model.py to refresh)",
+    }
+
+
 class Packet(BaseModel):
     IPLength: int
     IPHeaderLength: int
@@ -1062,6 +1100,35 @@ def root(request: Request):
         "redoc": f"{base}/redoc",
         "openapi_json": f"{base}/openapi.json",
         "health_db": f"{base}/health/db",
+        "health": f"{base}/health",
+        "health_models": f"{base}/health/models",
+    }
+
+
+@app.get(
+    "/health/models",
+    tags=["Core"],
+    summary="Model load status and training accuracy",
+    description=(
+        "Returns whether DDoS / brute-force models are loaded and **test-set accuracy** from "
+        "`model_metrics.json` (written when you run `train_model.py` and `train_bruteforce_model.py`). "
+        "`accuracy` is `null` until you train and commit or deploy that file."
+    ),
+)
+def models_health():
+    return _models_health_payload()
+
+
+@app.get(
+    "/health",
+    tags=["Core"],
+    summary="Combined health (Mongo + models)",
+    description="MongoDB status from `/health/db` plus model load/accuracy from `/health/models`.",
+)
+def health_combined():
+    return {
+        "mongo": db_health(),
+        "models": _models_health_payload(),
     }
 
 

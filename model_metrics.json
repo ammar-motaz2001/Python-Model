@@ -1,0 +1,13 @@
+{
+  "ddos": {
+    "accuracy": null,
+    "note": "Run train_model.py after ddos_dataset.xlsx / ddos.csv is available; this file is updated automatically."
+  },
+  "brute_force": {
+    "accuracy": 0.997972,
+    "evaluated_at_utc": "2026-04-01T05:37:44.977327+00:00",
+    "n_test_samples": 2959,
+    "test_size_fraction": 0.2,
+    "random_state": 42
+  }
+}

@@ -1,7 +1,12 @@
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
 import joblib
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 
 # load dataset (Excel; fallback to CSV if present)
 try:
@@ -27,7 +32,28 @@ model = RandomForestClassifier(n_estimators=100)
 # train model
 model.fit(X_train, y_train)
 
+y_pred = model.predict(X_test)
+accuracy = float(accuracy_score(y_test, y_pred))
+
 # save model
 joblib.dump(model, "model.pkl")
 
+# merge metrics for API /health
+metrics_path = Path("model_metrics.json")
+existing: dict = {}
+if metrics_path.is_file():
+    try:
+        existing = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        existing = {}
+existing["ddos"] = {
+    "accuracy": round(accuracy, 6),
+    "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
+    "n_test_samples": int(len(y_test)),
+    "test_size_fraction": 0.2,
+    "random_state": 42,
+}
+metrics_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+
 print("Model trained and saved successfully!")
+print(f"Test accuracy: {accuracy:.6f} (n_test={len(y_test)})")
