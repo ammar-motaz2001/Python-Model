@@ -382,6 +382,8 @@ def record_alert_tp_fp(
         )
     now = datetime.utcnow().isoformat()
     inc_field = "true_positive_count" if is_true_positive else "false_positive_count"
+    # Do not put true_positive_count / false_positive_count in $setOnInsert: same path as $inc
+    # causes MongoDB error 40 (path conflict). $inc creates the field from implicit 0 if missing.
     alerts_collection.update_one(
         {"device_id": device_id, "is_closed": False, "type": "firewall"},
         {
@@ -393,8 +395,6 @@ def record_alert_tp_fp(
                 "is_closed": False,
                 "created_at": now,
                 "attack_counts": {"ddos": 0, "brute_force": 0},
-                "true_positive_count": 0,
-                "false_positive_count": 0,
             },
             "$inc": {inc_field: 1},
             "$set": {"updated_at": now},
