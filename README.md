@@ -91,8 +91,7 @@ vercel env add WIFI_LOG_INGEST_KEY
 
 - Vercel filesystem is read-only except `/tmp`. This app writes logs under `/tmp/logs` automatically on Vercel.
 - `automation_service.py` is a long-running worker and should run on a VM/container, not Vercel serverless.
-- Model files (`model.pkl`, `model_bruteforce.pkl`, encoder `.pkl`) are gitignored by default.
-  Make sure they exist in deployment artifacts, otherwise detection endpoints can return `503`.
+- **Inference models** (`model.pkl`, `model_bruteforce.pkl`, `username_encoder.pkl`, `ip_encoder.pkl`) are **tracked in git** so Vercel builds include them. Regenerate with `train_model.py` / `train_bruteforce_model.py` and commit updated files if you retrain.
 
 ## Realtime dashboard (WebSocket)
 

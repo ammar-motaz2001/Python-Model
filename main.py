@@ -502,19 +502,22 @@ CLIENT_IPS: set[str] = set()
 CLIENT_IP_COUNTS: dict[str, int] = {}
 IP_ACTIONS: dict[str, list[dict]] = {}
 
-# load trained DDoS model
+# load trained models from app root (cwd differs on Vercel vs local uvicorn)
+_MODEL_DIR = Path(__file__).resolve().parent
 model = None
-if Path("model.pkl").exists():
-    model = joblib.load("model.pkl")
+_dd_path = _MODEL_DIR / "model.pkl"
+if _dd_path.is_file():
+    model = joblib.load(_dd_path)
 
 # load brute-force model and encoders if present
 model_bruteforce = None
 username_encoder = None
 ip_encoder = None
-if Path("model_bruteforce.pkl").exists():
-    model_bruteforce = joblib.load("model_bruteforce.pkl")
-    username_encoder = joblib.load("username_encoder.pkl")
-    ip_encoder = joblib.load("ip_encoder.pkl")
+_bf_path = _MODEL_DIR / "model_bruteforce.pkl"
+if _bf_path.is_file():
+    model_bruteforce = joblib.load(_bf_path)
+    username_encoder = joblib.load(_MODEL_DIR / "username_encoder.pkl")
+    ip_encoder = joblib.load(_MODEL_DIR / "ip_encoder.pkl")
 
 
 class Packet(BaseModel):

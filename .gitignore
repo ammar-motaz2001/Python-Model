@@ -17,8 +17,12 @@ __pycache__/
 .vscode/
 .DS_Store
 
-# Trained models (run train_model.py & train_bruteforce_model.py to regenerate)
+# Trained models — ignore by default; these four are tracked for API / Vercel (~1.2MB)
 *.pkl
+!model.pkl
+!model_bruteforce.pkl
+!username_encoder.pkl
+!ip_encoder.pkl
 
 # Large datasets (add yours locally; keep repo small)
 # ddos_dataset.xlsx
