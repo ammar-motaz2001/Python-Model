@@ -6,9 +6,10 @@
 
 ## Model accuracy in health API
 
-- **`GET /health`** — Mongo + models (includes **test-set accuracy** per model).
-- **`GET /health/models`** — load status + accuracy only.
-- Metrics live in **`model_metrics.json`** at the repo root. Run **`train_model.py`** (DDoS) and **`train_bruteforce_model.py`** (brute-force) to refresh; commit the updated JSON for Vercel.
+- **`GET /health/accuracy`** — single JSON: `{ "accuracy": <number|null> }` (mean of DDoS + brute-force test accuracies from `model_metrics.json`; `null` if none).
+- **`GET /health/models`** — same body as `/health/accuracy` (alias).
+- **`GET /health`** — `{ "mongo": {...}, "accuracy": <number|null> }`.
+- Refresh metrics by running **`train_model.py`** and **`train_bruteforce_model.py`**, then commit **`model_metrics.json`** for deploy.
 
 ## 1) Run Detector API
 

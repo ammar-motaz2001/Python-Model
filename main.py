@@ -576,26 +576,25 @@ def _load_model_metrics_file() -> dict:
 MODEL_METRICS: dict = _load_model_metrics_file()
 
 
-def _models_health_payload() -> dict:
+def _combined_model_accuracy() -> Optional[float]:
+    """
+    Single test-set accuracy across all models: mean of numeric `accuracy` values in
+    `model_metrics.json` for `ddos` and `brute_force` (only entries that exist and are numbers).
+    """
     dd = MODEL_METRICS.get("ddos") if isinstance(MODEL_METRICS.get("ddos"), dict) else {}
     bf = MODEL_METRICS.get("brute_force") if isinstance(MODEL_METRICS.get("brute_force"), dict) else {}
-    return {
-        "ddos": {
-            "loaded": model is not None,
-            "accuracy": dd.get("accuracy"),
-            "evaluated_at_utc": dd.get("evaluated_at_utc"),
-            "n_test_samples": dd.get("n_test_samples"),
-            "note": dd.get("note"),
-        },
-        "brute_force": {
-            "loaded": model_bruteforce is not None,
-            "accuracy": bf.get("accuracy"),
-            "evaluated_at_utc": bf.get("evaluated_at_utc"),
-            "n_test_samples": bf.get("n_test_samples"),
-            "note": bf.get("note"),
-        },
-        "metrics_source": "model_metrics.json (run train_model.py / train_bruteforce_model.py to refresh)",
-    }
+    vals: list[float] = []
+    for block in (dd, bf):
+        a = block.get("accuracy")
+        if a is not None and isinstance(a, (int, float)) and not isinstance(a, bool):
+            vals.append(float(a))
+    if not vals:
+        return None
+    return round(sum(vals) / len(vals), 6)
+
+
+def _accuracy_only_response() -> dict:
+    return {"accuracy": _combined_model_accuracy()}
 
 
 class Packet(BaseModel):
@@ -1101,34 +1100,45 @@ def root(request: Request):
         "openapi_json": f"{base}/openapi.json",
         "health_db": f"{base}/health/db",
         "health": f"{base}/health",
+        "health_accuracy": f"{base}/health/accuracy",
         "health_models": f"{base}/health/models",
     }
 
 
 @app.get(
-    "/health/models",
+    "/health/accuracy",
     tags=["Core"],
-    summary="Model load status and training accuracy",
+    summary="Combined model accuracy",
     description=(
-        "Returns whether DDoS / brute-force models are loaded and **test-set accuracy** from "
-        "`model_metrics.json` (written when you run `train_model.py` and `train_bruteforce_model.py`). "
-        "`accuracy` is `null` until you train and commit or deploy that file."
+        "Returns **`{ \"accuracy\": <number|null> }`** only. Value is the **mean** of test-set "
+        "accuracies from `model_metrics.json` for DDoS and brute-force (whichever are present). "
+        "`null` if no metrics yet — run `train_model.py` / `train_bruteforce_model.py`."
     ),
 )
+def health_accuracy():
+    return _accuracy_only_response()
+
+
+@app.get(
+    "/health/models",
+    tags=["Core"],
+    summary="Combined model accuracy (alias)",
+    description="Same response as **`GET /health/accuracy`**: `{ \"accuracy\": ... }`.",
+)
 def models_health():
-    return _models_health_payload()
+    return _accuracy_only_response()
 
 
 @app.get(
     "/health",
     tags=["Core"],
-    summary="Combined health (Mongo + models)",
-    description="MongoDB status from `/health/db` plus model load/accuracy from `/health/models`.",
+    summary="Combined health (Mongo + accuracy)",
+    description="MongoDB from `/health/db` plus single **`accuracy`** (mean of all model metrics).",
 )
 def health_combined():
     return {
         "mongo": db_health(),
-        "models": _models_health_payload(),
+        "accuracy": _combined_model_accuracy(),
     }
 
 
