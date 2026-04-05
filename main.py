@@ -302,6 +302,12 @@ def serialize_doc(doc: Optional[dict]) -> Optional[dict]:
     return payload
 
 
+def _apply_analyst_close_totals_defaults(payload: dict) -> None:
+    """Default analyst-only close counters when absent (e.g. legacy `alerts` docs)."""
+    payload.setdefault("total_closed_as_false_positive", 0)
+    payload.setdefault("total_closed_as_true_positive", 0)
+
+
 # GET /alerts sort: critical → high → medium → low, then newest created_at within tier
 _ALERT_PRIORITY_RANK: dict[str, int] = {
     "critical": 0,
@@ -350,6 +356,7 @@ def serialize_alert_for_response(doc: Optional[dict]) -> Optional[dict]:
     payload = serialize_doc(doc)
     if payload is None:
         return None
+    _apply_analyst_close_totals_defaults(payload)
     raw_did = None if doc is None else doc.get("device_id")
     if raw_did is not None:
         ip_map = _batch_device_ip_by_object_id([raw_did])
@@ -367,6 +374,7 @@ def serialize_alerts_for_list(raw_docs: list[dict]) -> list[dict]:
         s = serialize_doc(doc)
         if s is None:
             continue
+        _apply_analyst_close_totals_defaults(s)
         did = doc.get("device_id")
         s["device_ip"] = ip_map.get(str(did)) if did is not None else None
         out.append(s)
@@ -419,6 +427,8 @@ def upsert_attack_alert(device_id: ObjectId, attack_type: str) -> Optional[dict]
                 "created_at": now,
                 "true_positive_count": 0,
                 "false_positive_count": 0,
+                "total_closed_as_false_positive": 0,
+                "total_closed_as_true_positive": 0,
             },
             "$inc": {inc_field: 1},
             "$set": {"updated_at": now},
@@ -467,6 +477,8 @@ def record_alert_tp_fp(
                 "is_closed": False,
                 "created_at": now,
                 "attack_counts": {"ddos": 0, "brute_force": 0},
+                "total_closed_as_false_positive": 0,
+                "total_closed_as_true_positive": 0,
             },
             "$inc": {inc_field: 1},
             "$set": {"updated_at": now},
@@ -882,6 +894,8 @@ def create_alert(payload: AlertCreate):
         "type": payload.type,
         "is_closed": payload.is_closed,
         "attack_counts": payload.attack_counts,
+        "total_closed_as_false_positive": 0,
+        "total_closed_as_true_positive": 0,
         "created_at": now,
         "updated_at": now,
     }
@@ -901,8 +915,9 @@ def create_alert(payload: AlertCreate):
         "then **newest `created_at`** within each tier. "
         "Open `firewall` alerts include TP/FP counts from detect. "
         "Each alert includes **`device_ip`** when `device_id` resolves in `devices`. "
-        "After **`PATCH .../close-as-*`**, the same row shows **`is_closed`**, **`close_verdict`**, "
-        "**`closed_at`**."
+        "Analyst closes increment **`total_closed_as_false_positive`** or "
+        "**`total_closed_as_true_positive`** (separate from model **`true_positive_count`** / "
+        "**`false_positive_count`**)."
     ),
 )
 def list_alerts():
@@ -922,8 +937,8 @@ def list_alerts():
 
 def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
     """
-    Persist closure on the alert document (same `alerts` collection as GET /alerts) and
-    publish a realtime event so UIs can merge the updated row without guessing.
+    Persist closure and increment analyst-only totals: **`total_closed_as_false_positive`**
+    or **`total_closed_as_true_positive`** (model counters unchanged).
     """
     if alerts_collection is None:
         return {"error": "MongoDB is not connected"}
@@ -937,6 +952,11 @@ def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
     if existing.get("is_closed"):
         raise HTTPException(status_code=400, detail="Alert is already closed")
     now = datetime.utcnow().isoformat()
+    inc_field = (
+        "total_closed_as_false_positive"
+        if verdict == "false_positive"
+        else "total_closed_as_true_positive"
+    )
     alerts_collection.update_one(
         {"_id": oid},
         {
@@ -946,6 +966,7 @@ def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
                 "closed_at": now,
                 "updated_at": now,
             },
+            "$inc": {inc_field: 1},
         },
     )
     updated = alerts_collection.find_one({"_id": oid})
@@ -967,10 +988,8 @@ def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
     tags=["MongoDB"],
     summary="Close alert as false positive",
     description=(
-        "Updates the **`alerts`** document: **`is_closed`**, **`close_verdict`: `false_positive`**, "
-        "**`closed_at`**. **`GET /alerts`** returns this state after refetch. Publishes "
-        "**`kind`: `alert`**, **`action`: `closed`** on **`WS /ws/events`** with full **`alert`** "
-        "payload (same shape as list items) for live UI updates."
+        "Updates **`alerts`**: closure fields plus **`$inc` `total_closed_as_false_positive`** by **1**. "
+        "Does not change model **`false_positive_count`**. Publishes **`WS /ws/events`** **`alert`** event."
     ),
 )
 def close_alert_as_false_positive(alert_id: str):
@@ -982,8 +1001,8 @@ def close_alert_as_false_positive(alert_id: str):
     tags=["MongoDB"],
     summary="Close alert as true positive",
     description=(
-        "Same as close-as-false-positive but **`close_verdict`: `true_positive`**. "
-        "Persists to **`alerts`** and broadcasts on **`WS /ws/events`**."
+        "**`close_verdict`: `true_positive`** and **`$inc` `total_closed_as_true_positive`** by **1**. "
+        "Does not change model **`true_positive_count`**."
     ),
 )
 def close_alert_as_true_positive(alert_id: str):
