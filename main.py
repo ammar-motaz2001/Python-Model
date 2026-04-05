@@ -900,7 +900,9 @@ def create_alert(payload: AlertCreate):
         "**critical** → **high** → **medium** → **low** (case-insensitive; unknown values last), "
         "then **newest `created_at`** within each tier. "
         "Open `firewall` alerts include TP/FP counts from detect. "
-        "Each alert includes **`device_ip`** when `device_id` resolves in `devices`."
+        "Each alert includes **`device_ip`** when `device_id` resolves in `devices`. "
+        "After **`PATCH .../close-as-*`**, the same row shows **`is_closed`**, **`close_verdict`**, "
+        "**`closed_at`**."
     ),
 )
 def list_alerts():
@@ -919,7 +921,10 @@ def list_alerts():
 
 
 def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
-    """Set is_closed, close_verdict, closed_at. Raises HTTPException on bad id / state."""
+    """
+    Persist closure on the alert document (same `alerts` collection as GET /alerts) and
+    publish a realtime event so UIs can merge the updated row without guessing.
+    """
     if alerts_collection is None:
         return {"error": "MongoDB is not connected"}
     try:
@@ -944,7 +949,17 @@ def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
         },
     )
     updated = alerts_collection.find_one({"_id": oid})
-    return serialize_alert_for_response(updated) or {}
+    out = serialize_alert_for_response(updated) or {}
+    publish_event(
+        {
+            "kind": "alert",
+            "action": "closed",
+            "close_verdict": verdict,
+            "alert_id": alert_id,
+            "alert": out,
+        },
+    )
+    return out
 
 
 @app.patch(
@@ -952,8 +967,10 @@ def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
     tags=["MongoDB"],
     summary="Close alert as false positive",
     description=(
-        "Marks the alert closed with **`close_verdict`: `false_positive`** and **`closed_at`**. "
-        "Returns the updated alert including **`device_ip`**."
+        "Updates the **`alerts`** document: **`is_closed`**, **`close_verdict`: `false_positive`**, "
+        "**`closed_at`**. **`GET /alerts`** returns this state after refetch. Publishes "
+        "**`kind`: `alert`**, **`action`: `closed`** on **`WS /ws/events`** with full **`alert`** "
+        "payload (same shape as list items) for live UI updates."
     ),
 )
 def close_alert_as_false_positive(alert_id: str):
@@ -965,8 +982,8 @@ def close_alert_as_false_positive(alert_id: str):
     tags=["MongoDB"],
     summary="Close alert as true positive",
     description=(
-        "Marks the alert closed with **`close_verdict`: `true_positive`** and **`closed_at`**. "
-        "Returns the updated alert including **`device_ip`**."
+        "Same as close-as-false-positive but **`close_verdict`: `true_positive`**. "
+        "Persists to **`alerts`** and broadcasts on **`WS /ws/events`**."
     ),
 )
 def close_alert_as_true_positive(alert_id: str):
