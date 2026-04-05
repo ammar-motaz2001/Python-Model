@@ -915,9 +915,8 @@ def create_alert(payload: AlertCreate):
         "then **newest `created_at`** within each tier. "
         "Open `firewall` alerts include TP/FP counts from detect. "
         "Each alert includes **`device_ip`** when `device_id` resolves in `devices`. "
-        "Analyst closes increment **`total_closed_as_false_positive`** or "
-        "**`total_closed_as_true_positive`** (separate from model **`true_positive_count`** / "
-        "**`false_positive_count`**)."
+        "Analyst closes increment **`total_closed_as_*`** and the matching **`true_positive_count`** / "
+        "**`false_positive_count`** by **1** each."
     ),
 )
 def list_alerts():
@@ -937,8 +936,9 @@ def list_alerts():
 
 def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
     """
-    Persist closure and increment analyst-only totals: **`total_closed_as_false_positive`**
-    or **`total_closed_as_true_positive`** (model counters unchanged).
+    Persist closure and increment:
+    - Analyst columns: **`total_closed_as_false_positive`** / **`total_closed_as_true_positive`**
+    - Display counters: **`false_positive_count`** / **`true_positive_count`** (so GET /alerts matches UI)
     """
     if alerts_collection is None:
         return {"error": "MongoDB is not connected"}
@@ -952,11 +952,16 @@ def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
     if existing.get("is_closed"):
         raise HTTPException(status_code=400, detail="Alert is already closed")
     now = datetime.utcnow().isoformat()
-    inc_field = (
-        "total_closed_as_false_positive"
-        if verdict == "false_positive"
-        else "total_closed_as_true_positive"
-    )
+    if verdict == "false_positive":
+        inc_updates = {
+            "total_closed_as_false_positive": 1,
+            "false_positive_count": 1,
+        }
+    else:
+        inc_updates = {
+            "total_closed_as_true_positive": 1,
+            "true_positive_count": 1,
+        }
     alerts_collection.update_one(
         {"_id": oid},
         {
@@ -966,7 +971,7 @@ def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
                 "closed_at": now,
                 "updated_at": now,
             },
-            "$inc": {inc_field: 1},
+            "$inc": inc_updates,
         },
     )
     updated = alerts_collection.find_one({"_id": oid})
@@ -988,8 +993,8 @@ def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
     tags=["MongoDB"],
     summary="Close alert as false positive",
     description=(
-        "Updates **`alerts`**: closure fields plus **`$inc` `total_closed_as_false_positive`** by **1**. "
-        "Does not change model **`false_positive_count`**. Publishes **`WS /ws/events`** **`alert`** event."
+        "Closure fields plus **`$inc`**: **`total_closed_as_false_positive`** and **`false_positive_count`** "
+        "each by **1**. Publishes **`WS /ws/events`** **`alert`** event."
     ),
 )
 def close_alert_as_false_positive(alert_id: str):
@@ -1001,8 +1006,8 @@ def close_alert_as_false_positive(alert_id: str):
     tags=["MongoDB"],
     summary="Close alert as true positive",
     description=(
-        "**`close_verdict`: `true_positive`** and **`$inc` `total_closed_as_true_positive`** by **1**. "
-        "Does not change model **`true_positive_count`**."
+        "**`close_verdict`: `true_positive`** plus **`$inc`**: **`total_closed_as_true_positive`** and "
+        "**`true_positive_count`** each by **1**."
     ),
 )
 def close_alert_as_true_positive(alert_id: str):
