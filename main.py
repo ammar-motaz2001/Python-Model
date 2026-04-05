@@ -301,6 +301,36 @@ def serialize_doc(doc: Optional[dict]) -> Optional[dict]:
     return payload
 
 
+# GET /alerts sort: critical → high → medium → low, then newest created_at within tier
+_ALERT_PRIORITY_RANK: dict[str, int] = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "midum": 2,
+    "midium": 2,
+    "low": 3,
+}
+
+
+def _alert_priority_rank(priority: object) -> int:
+    if priority is None:
+        return 99
+    return _ALERT_PRIORITY_RANK.get(str(priority).strip().lower(), 99)
+
+
+def _alert_list_sort_key(doc: dict) -> tuple:
+    rank = _alert_priority_rank(doc.get("priority"))
+    neg_epoch = 0.0
+    ts_raw = doc.get("created_at")
+    if ts_raw:
+        try:
+            s = str(ts_raw).replace("Z", "+00:00")
+            neg_epoch = -datetime.fromisoformat(s).timestamp()
+        except (TypeError, ValueError, OSError):
+            neg_epoch = 0.0
+    return (rank, neg_epoch)
+
+
 def ensure_device(ip: str) -> Optional[dict]:
     """Get or create a device record by IP."""
     if devices_collection is None:
@@ -822,17 +852,25 @@ def create_alert(payload: AlertCreate):
     tags=["MongoDB"],
     summary="List alerts",
     description=(
-        "Returns all documents from the `alerts` collection, newest first. Open "
-        "`firewall` alerts include **`true_positive_count`** and **`false_positive_count`** "
-        "updated on each detect: DDoS TP=model attack, FP=benign; brute-force TP=model attack "
-        f"with `password_count` ≥ **`{BF_AUTO_BLOCK_THRESHOLD}`**, FP otherwise (e.g. low tries)."
+        "Returns **`total_alerts`**, **`total_closed`**, and **`alerts`** ordered by **`priority`**: "
+        "**critical** → **high** → **medium** → **low** (case-insensitive; unknown values last), "
+        "then **newest `created_at`** within each tier. "
+        "Open `firewall` alerts include TP/FP counts from detect."
     ),
 )
 def list_alerts():
     if alerts_collection is None:
         return {"error": "MongoDB is not connected"}
-    docs = [serialize_doc(doc) for doc in alerts_collection.find().sort("created_at", -1)]
-    return {"alerts": docs}
+    total_alerts = alerts_collection.count_documents({})
+    total_closed = alerts_collection.count_documents({"is_closed": True})
+    raw_docs = list(alerts_collection.find())
+    raw_docs.sort(key=_alert_list_sort_key)
+    docs = [serialize_doc(doc) for doc in raw_docs]
+    return {
+        "total_alerts": total_alerts,
+        "total_closed": total_closed,
+        "alerts": docs,
+    }
 
 
 @app.post(
