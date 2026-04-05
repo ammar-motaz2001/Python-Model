@@ -55,6 +55,7 @@ import numpy as np
 import joblib
 import redis
 from bson import ObjectId
+from bson.errors import InvalidId
 from pymongo import MongoClient
 
 _OPENAPI_TAGS = [
@@ -329,6 +330,47 @@ def _alert_list_sort_key(doc: dict) -> tuple:
         except (TypeError, ValueError, OSError):
             neg_epoch = 0.0
     return (rank, neg_epoch)
+
+
+def _batch_device_ip_by_object_id(oids: list) -> dict[str, Optional[str]]:
+    """Map device ObjectId string -> IP for batch alert responses."""
+    if devices_collection is None:
+        return {}
+    unique = list({o for o in oids if o is not None})
+    if not unique:
+        return {}
+    out: dict[str, Optional[str]] = {}
+    for row in devices_collection.find({"_id": {"$in": unique}}, {"_id": 1, "ip": 1}):
+        out[str(row["_id"])] = row.get("ip")
+    return out
+
+
+def serialize_alert_for_response(doc: Optional[dict]) -> Optional[dict]:
+    """Like serialize_doc for alerts plus resolved `device_ip` from `devices`."""
+    payload = serialize_doc(doc)
+    if payload is None:
+        return None
+    raw_did = None if doc is None else doc.get("device_id")
+    if raw_did is not None:
+        ip_map = _batch_device_ip_by_object_id([raw_did])
+        payload["device_ip"] = ip_map.get(str(raw_did))
+    else:
+        payload["device_ip"] = None
+    return payload
+
+
+def serialize_alerts_for_list(raw_docs: list[dict]) -> list[dict]:
+    """Serialize alert documents with one batched device IP lookup."""
+    ip_map = _batch_device_ip_by_object_id([d.get("device_id") for d in raw_docs])
+    out: list[dict] = []
+    for doc in raw_docs:
+        s = serialize_doc(doc)
+        if s is None:
+            continue
+        did = doc.get("device_id")
+        s["device_ip"] = ip_map.get(str(did)) if did is not None else None
+        out.append(s)
+    return out
 
 
 def ensure_device(ip: str) -> Optional[dict]:
@@ -844,7 +886,9 @@ def create_alert(payload: AlertCreate):
         "updated_at": now,
     }
     result = alerts_collection.insert_one(doc)
-    return serialize_doc(alerts_collection.find_one({"_id": result.inserted_id}))
+    return serialize_alert_for_response(
+        alerts_collection.find_one({"_id": result.inserted_id}),
+    )
 
 
 @app.get(
@@ -855,7 +899,8 @@ def create_alert(payload: AlertCreate):
         "Returns **`total_alerts`**, **`total_closed`**, and **`alerts`** ordered by **`priority`**: "
         "**critical** → **high** → **medium** → **low** (case-insensitive; unknown values last), "
         "then **newest `created_at`** within each tier. "
-        "Open `firewall` alerts include TP/FP counts from detect."
+        "Open `firewall` alerts include TP/FP counts from detect. "
+        "Each alert includes **`device_ip`** when `device_id` resolves in `devices`."
     ),
 )
 def list_alerts():
@@ -865,12 +910,67 @@ def list_alerts():
     total_closed = alerts_collection.count_documents({"is_closed": True})
     raw_docs = list(alerts_collection.find())
     raw_docs.sort(key=_alert_list_sort_key)
-    docs = [serialize_doc(doc) for doc in raw_docs]
+    docs = serialize_alerts_for_list(raw_docs)
     return {
         "total_alerts": total_alerts,
         "total_closed": total_closed,
         "alerts": docs,
     }
+
+
+def _close_alert_with_verdict(alert_id: str, verdict: str) -> dict:
+    """Set is_closed, close_verdict, closed_at. Raises HTTPException on bad id / state."""
+    if alerts_collection is None:
+        return {"error": "MongoDB is not connected"}
+    try:
+        oid = ObjectId(alert_id)
+    except InvalidId as exc:
+        raise HTTPException(status_code=422, detail="Invalid alert id") from exc
+    existing = alerts_collection.find_one({"_id": oid})
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    if existing.get("is_closed"):
+        raise HTTPException(status_code=400, detail="Alert is already closed")
+    now = datetime.utcnow().isoformat()
+    alerts_collection.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "is_closed": True,
+                "close_verdict": verdict,
+                "closed_at": now,
+                "updated_at": now,
+            },
+        },
+    )
+    updated = alerts_collection.find_one({"_id": oid})
+    return serialize_alert_for_response(updated) or {}
+
+
+@app.patch(
+    "/alerts/{alert_id}/close-as-false-positive",
+    tags=["MongoDB"],
+    summary="Close alert as false positive",
+    description=(
+        "Marks the alert closed with **`close_verdict`: `false_positive`** and **`closed_at`**. "
+        "Returns the updated alert including **`device_ip`**."
+    ),
+)
+def close_alert_as_false_positive(alert_id: str):
+    return _close_alert_with_verdict(alert_id, "false_positive")
+
+
+@app.patch(
+    "/alerts/{alert_id}/close-as-true-positive",
+    tags=["MongoDB"],
+    summary="Close alert as true positive",
+    description=(
+        "Marks the alert closed with **`close_verdict`: `true_positive`** and **`closed_at`**. "
+        "Returns the updated alert including **`device_ip`**."
+    ),
+)
+def close_alert_as_true_positive(alert_id: str):
+    return _close_alert_with_verdict(alert_id, "true_positive")
 
 
 @app.post(
