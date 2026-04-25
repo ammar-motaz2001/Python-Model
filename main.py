@@ -719,6 +719,25 @@ def _ensure_ddos_model_loaded():
             logger.warning("Failed loading DDoS model from DDOS_MODEL_URL: %s", exc)
             return None
 
+
+def _ddos_model_debug_status() -> dict:
+    """Diagnostics for DDoS model availability in deployment."""
+    loaded_model = _ensure_ddos_model_loaded()
+    return {
+        "ddos_model_loaded": loaded_model is not None,
+        "loaded_from": (
+            "memory"
+            if loaded_model is not None and model is not None and _dd_path.is_file()
+            else "tmp_cache"
+            if loaded_model is not None and _DDOS_MODEL_TMP_PATH.is_file()
+            else None
+        ),
+        "model_path_exists": _dd_path.is_file(),
+        "tmp_model_path_exists": _DDOS_MODEL_TMP_PATH.is_file(),
+        "ddos_model_url_configured": bool(_DDOS_MODEL_URL),
+        "ddos_model_url": _DDOS_MODEL_URL if _DDOS_MODEL_URL else None,
+    }
+
 # load brute-force model and encoders if present
 model_bruteforce = None
 username_encoder = None
@@ -1561,6 +1580,19 @@ def get_ddos_request_attempt(
 )
 def health_accuracy():
     return _accuracy_only_response()
+
+
+@app.get(
+    "/health/model-ddos",
+    tags=["Core"],
+    summary="DDoS model availability debug",
+    description=(
+        "Returns whether DDoS model is loaded and where it came from "
+        "(local artifact, /tmp cache, or DDOS_MODEL_URL)."
+    ),
+)
+def health_model_ddos():
+    return _ddos_model_debug_status()
 
 
 @app.get(
