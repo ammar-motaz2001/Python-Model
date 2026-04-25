@@ -11,6 +11,8 @@ import shlex
 import subprocess
 import ipaddress
 import threading
+from urllib.error import URLError
+from urllib.request import urlopen
 
 try:
     from dotenv import load_dotenv
@@ -675,8 +677,47 @@ IP_ACTIONS: dict[str, list[dict]] = {}
 _MODEL_DIR = Path(__file__).resolve().parent
 model = None
 _dd_path = _MODEL_DIR / "model.pkl"
-if _dd_path.is_file():
-    model = joblib.load(_dd_path)
+_DDOS_MODEL_URL = os.getenv("DDOS_MODEL_URL", "").strip()
+_DDOS_MODEL_DOWNLOAD_TIMEOUT_SEC = float(os.getenv("DDOS_MODEL_DOWNLOAD_TIMEOUT_SEC", "20"))
+_DDOS_MODEL_TMP_PATH = Path("/tmp/model.pkl")
+_MODEL_LOAD_LOCK = threading.Lock()
+
+
+def _ensure_ddos_model_loaded():
+    """Load DDoS model from local artifact, or download once at runtime."""
+    global model
+    if model is not None:
+        return model
+
+    with _MODEL_LOAD_LOCK:
+        if model is not None:
+            return model
+
+        if _dd_path.is_file():
+            model = joblib.load(_dd_path)
+            return model
+
+        if _DDOS_MODEL_TMP_PATH.is_file():
+            model = joblib.load(_DDOS_MODEL_TMP_PATH)
+            return model
+
+        if not _DDOS_MODEL_URL:
+            return None
+
+        try:
+            with urlopen(_DDOS_MODEL_URL, timeout=_DDOS_MODEL_DOWNLOAD_TIMEOUT_SEC) as response:
+                payload = response.read()
+            if not payload:
+                logger.warning("DDOS_MODEL_URL returned empty payload")
+                return None
+            _DDOS_MODEL_TMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _DDOS_MODEL_TMP_PATH.write_bytes(payload)
+            model = joblib.load(_DDOS_MODEL_TMP_PATH)
+            logger.info("Loaded DDoS model from DDOS_MODEL_URL into %s", _DDOS_MODEL_TMP_PATH)
+            return model
+        except (URLError, OSError, ValueError, EOFError) as exc:
+            logger.warning("Failed loading DDoS model from DDOS_MODEL_URL: %s", exc)
+            return None
 
 # load brute-force model and encoders if present
 model_bruteforce = None
@@ -1798,12 +1839,13 @@ def detect_ddos_from_packet(
     DDoS model + Mongo/Redis/actions — same behavior as POST /detect with a JSON Packet body.
     Used by GET /detect/packet-auto and POST /detect/packet-auto/upload.
     """
-    if model is None:
+    loaded_model = _ensure_ddos_model_loaded()
+    if loaded_model is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "DDoS model is not available. Add model.pkl to deployment artifact or "
-                "download it at runtime before calling detection endpoints."
+                "DDoS model is not available. Add model.pkl to deployment artifact, or set "
+                "DDOS_MODEL_URL to a downloadable model file before calling detection endpoints."
             ),
         )
 
@@ -1829,7 +1871,7 @@ def detect_ddos_from_packet(
     ]])
 
     try:
-        prediction = model.predict(features)[0]
+        prediction = loaded_model.predict(features)[0]
     except Exception as exc:
         logger.exception("DDoS model.predict failed")
         raise HTTPException(
