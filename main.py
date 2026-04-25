@@ -823,6 +823,65 @@ _BF_IP_ENCODER_TMP_PATH = Path("/tmp/ip_encoder.pkl")
 _BF_MODEL_SOURCE: Optional[str] = None
 
 
+def _train_bruteforce_fallback_artifacts():
+    """Train brute-force model + encoders from bundled dataset and cache to /tmp."""
+    data_path = _MODEL_DIR / "mixed_dataset.csv"
+    if not data_path.is_file():
+        return None, None, None
+    try:
+        import pandas as pd
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.preprocessing import LabelEncoder
+    except ImportError as exc:
+        logger.warning("Brute-force fallback training deps are unavailable: %s", exc)
+        return None, None, None
+
+    def _password_count(value):
+        try:
+            raw = str(value).strip()
+            if raw.startswith("["):
+                return max(1, raw.count(",") + 1)
+            return 1
+        except Exception:
+            return 1
+
+    def _parse_ts(ts_value):
+        try:
+            parsed = datetime.strptime(str(ts_value).strip(), "%a %b %d %H:%M:%S %Y")
+            return parsed.hour, parsed.weekday()
+        except Exception:
+            return 12, 0
+
+    try:
+        df = pd.read_csv(data_path)
+        required_cols = {"username", "timestamp", "passwords", "foreign_ip", "Label"}
+        if not required_cols.issubset(set(df.columns)):
+            logger.warning("Brute-force fallback dataset missing required columns: %s", data_path)
+            return None, None, None
+
+        df["password_count"] = df["passwords"].apply(_password_count)
+        df[["hour", "day_of_week"]] = df["timestamp"].apply(lambda x: pd.Series(_parse_ts(x)))
+        username_enc = LabelEncoder()
+        ip_enc = LabelEncoder()
+        df["username_enc"] = username_enc.fit_transform(df["username"].astype(str))
+        df["foreign_ip_enc"] = ip_enc.fit_transform(df["foreign_ip"].astype(str))
+        x = df[["username_enc", "hour", "day_of_week", "password_count", "foreign_ip_enc"]]
+        y = df["Label"].astype(int)
+
+        trained_model = RandomForestClassifier(n_estimators=80, random_state=42)
+        trained_model.fit(x, y)
+
+        _BF_MODEL_TMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(trained_model, _BF_MODEL_TMP_PATH)
+        joblib.dump(username_enc, _BF_USERNAME_ENCODER_TMP_PATH)
+        joblib.dump(ip_enc, _BF_IP_ENCODER_TMP_PATH)
+        logger.info("Trained brute-force fallback artifacts from %s", data_path)
+        return trained_model, username_enc, ip_enc
+    except Exception as exc:
+        logger.warning("Brute-force fallback training failed: %s", exc)
+        return None, None, None
+
+
 def _try_download_to_tmp(url: str, tmp_path: Path, kind: str) -> bool:
     if not url:
         return False
@@ -891,6 +950,11 @@ def _ensure_bruteforce_artifacts_loaded():
                 _BF_MODEL_SOURCE = "url_download"
                 return model_bruteforce, username_encoder, ip_encoder
 
+        model_bruteforce, username_encoder, ip_encoder = _train_bruteforce_fallback_artifacts()
+        if model_bruteforce is not None and username_encoder is not None and ip_encoder is not None:
+            _BF_MODEL_SOURCE = "trained_fallback"
+            return model_bruteforce, username_encoder, ip_encoder
+
         return None, None, None
 
 
@@ -910,6 +974,7 @@ def _bruteforce_model_debug_status() -> dict:
         "bf_model_url_configured": bool(_BF_MODEL_URL),
         "bf_username_encoder_url_configured": bool(_BF_USERNAME_ENCODER_URL),
         "bf_ip_encoder_url_configured": bool(_BF_IP_ENCODER_URL),
+        "fallback_dataset_exists": (_MODEL_DIR / "mixed_dataset.csv").is_file(),
     }
 
 
