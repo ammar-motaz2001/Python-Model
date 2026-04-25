@@ -94,6 +94,10 @@ _OPENAPI_TAGS = [
         "name": "Realtime",
         "description": "Dashboard events via GET backlog and WebSocket stream.",
     },
+    {
+        "name": "Requests",
+        "description": "Per-IP request attempt counters with auto-block thresholds.",
+    },
 ]
 
 _AUTH_OPENAPI_TAGS = [
@@ -218,6 +222,8 @@ devices_collection = None
 alerts_collection = None
 actions_collection = None
 users_collection = None
+request_attempts_collection = None
+ddos_request_attempts_collection = None
 try:
     mongo_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=10000)
     mongo_client.admin.command("ping")
@@ -226,6 +232,8 @@ try:
     alerts_collection = db["alerts"]
     actions_collection = db["automated_actions"]
     users_collection = db["users"]
+    request_attempts_collection = db["request_attempts"]
+    ddos_request_attempts_collection = db["ddos_request_attempts"]
     MONGO_LAST_ERROR = None
     logger.info("MongoDB connected successfully: %s/%s", MONGO_URL, MONGO_DB)
 except Exception as exc:
@@ -247,7 +255,15 @@ def initialize_mongo() -> None:
         return
     now = datetime.utcnow().isoformat()
     existing = set(db.list_collection_names())
-    for name in ["devices", "alerts", "automated_actions", "users", "app_meta"]:
+    for name in [
+        "devices",
+        "alerts",
+        "automated_actions",
+        "users",
+        "request_attempts",
+        "ddos_request_attempts",
+        "app_meta",
+    ]:
         if name not in existing:
             db.create_collection(name)
     db["app_meta"].update_one(
@@ -856,6 +872,66 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RequestAttemptResponse(BaseModel):
+    attempt: int
+    count: int
+    is_blocked: bool
+    device_ip: str
+    threshold: int
+
+
+def _resolve_target_ip(request: Request, device_ip: Optional[str] = None) -> str:
+    ip = (device_ip or (request.client.host if request.client else "") or "").strip()
+    if not ip:
+        raise HTTPException(status_code=422, detail="Could not resolve device IP")
+    return _validate_ip_or_raise(ip)
+
+
+def _upsert_attempt_counter(collection, ip: str, threshold: int) -> dict:
+    if collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB is not connected")
+    now = datetime.utcnow().isoformat()
+    collection.update_one(
+        {"ip": ip},
+        {
+            "$inc": {"count": 1},
+            "$set": {"updated_at": now, "threshold": threshold},
+            "$setOnInsert": {"ip": ip, "created_at": now},
+        },
+        upsert=True,
+    )
+    updated = collection.find_one({"ip": ip}) or {}
+    count = int(updated.get("count", 0))
+    is_blocked = count >= threshold
+    if is_blocked:
+        BLOCKED_IPS.add(ip)
+        persist_device_is_blocked(ip, True)
+    else:
+        persist_device_is_blocked(ip, False)
+    return {
+        "attempt": count,
+        "count": count,
+        "is_blocked": is_blocked,
+        "device_ip": ip,
+        "threshold": threshold,
+    }
+
+
+def _get_attempt_counter(collection, ip: str, threshold: int) -> dict:
+    if collection is None:
+        raise HTTPException(status_code=503, detail="MongoDB is not connected")
+    doc = collection.find_one({"ip": ip}) or {}
+    count = int(doc.get("count", 0))
+    is_blocked = bool(count >= threshold or ip in BLOCKED_IPS)
+    if is_blocked:
+        persist_device_is_blocked(ip, True)
+    return {
+        "count": count,
+        "is_blocked": is_blocked,
+        "device_ip": ip,
+    }
+
+
 @app.get(
     "/actions/blocked-ips",
     tags=["Actions"],
@@ -1346,6 +1422,88 @@ def login(payload: LoginRequest):
 
 
 app.mount("/auth", auth_app)
+
+
+@app.post(
+    "/request",
+    tags=["Requests"],
+    summary="Increment normal request attempt",
+    description=(
+        "Increments per-IP attempt counter in MongoDB `request_attempts`. "
+        "Returns current attempt/count and blocks IP when count >= 6."
+    ),
+    response_model=RequestAttemptResponse,
+)
+def post_request_attempt(
+    request: Request,
+    device_ip: Optional[str] = Query(
+        None,
+        description="Optional target IP. Defaults to caller IP.",
+    ),
+):
+    ip = _resolve_target_ip(request, device_ip)
+    return _upsert_attempt_counter(request_attempts_collection, ip, threshold=6)
+
+
+@app.get(
+    "/request",
+    tags=["Requests"],
+    summary="Get normal request counter status",
+    description=(
+        "Returns per-IP normal request status from MongoDB `request_attempts`: "
+        "`count`, `is_blocked`, and `device_ip`."
+    ),
+)
+def get_request_attempt(
+    request: Request,
+    device_ip: Optional[str] = Query(
+        None,
+        description="Optional target IP. Defaults to caller IP.",
+    ),
+):
+    ip = _resolve_target_ip(request, device_ip)
+    return _get_attempt_counter(request_attempts_collection, ip, threshold=6)
+
+
+@app.post(
+    "/ddos-request",
+    tags=["Requests"],
+    summary="Increment DDoS request attempt",
+    description=(
+        "Increments per-IP DDoS attempt counter in MongoDB `ddos_request_attempts`. "
+        "Returns current attempt/count and blocks IP when count >= 20."
+    ),
+    response_model=RequestAttemptResponse,
+)
+def post_ddos_request_attempt(
+    request: Request,
+    device_ip: Optional[str] = Query(
+        None,
+        description="Optional target IP. Defaults to caller IP.",
+    ),
+):
+    ip = _resolve_target_ip(request, device_ip)
+    return _upsert_attempt_counter(ddos_request_attempts_collection, ip, threshold=20)
+
+
+@app.get(
+    "/ddos-request",
+    tags=["Requests"],
+    summary="Get DDoS request counter status",
+    description=(
+        "Returns per-IP DDoS request status from MongoDB `ddos_request_attempts`: "
+        "`count`, `is_blocked`, and `device_ip`."
+    ),
+)
+def get_ddos_request_attempt(
+    request: Request,
+    device_ip: Optional[str] = Query(
+        None,
+        description="Optional target IP. Defaults to caller IP.",
+    ),
+):
+    ip = _resolve_target_ip(request, device_ip)
+    return _get_attempt_counter(ddos_request_attempts_collection, ip, threshold=20)
 
 
 @app.get(
