@@ -681,11 +681,74 @@ _DDOS_MODEL_URL = os.getenv("DDOS_MODEL_URL", "").strip()
 _DDOS_MODEL_DOWNLOAD_TIMEOUT_SEC = float(os.getenv("DDOS_MODEL_DOWNLOAD_TIMEOUT_SEC", "20"))
 _DDOS_MODEL_TMP_PATH = Path("/tmp/model.pkl")
 _MODEL_LOAD_LOCK = threading.Lock()
+_DDOS_MODEL_SOURCE: Optional[str] = None
+
+_DDOS_FEATURE_COLUMNS = [
+    "IPLength",
+    "IPHeaderLength",
+    "TTL",
+    "Protocol",
+    "SourcePort",
+    "DestPort",
+    "SequenceNumber",
+    "AckNumber",
+    "WindowSize",
+    "TCPHeaderLength",
+    "TCPLength",
+    "TCPStream",
+    "TCPUrgentPointer",
+    "IPFlags",
+    "IPID",
+    "IPchecksum",
+    "TCPflags",
+    "TCPChecksum",
+]
+
+
+def _train_ddos_fallback_model():
+    """Train a fallback DDoS model from bundled dataset files."""
+    dataset_paths = [_MODEL_DIR / "ddos_dataset.xlsx", _MODEL_DIR / "ddos.csv"]
+    data_path = next((p for p in dataset_paths if p.is_file()), None)
+    if data_path is None:
+        return None
+    try:
+        import pandas as pd
+        from sklearn.ensemble import RandomForestClassifier
+    except ImportError as exc:
+        logger.warning("Fallback training deps are unavailable: %s", exc)
+        return None
+    try:
+        if data_path.suffix.lower() == ".xlsx":
+            df = pd.read_excel(data_path)
+        else:
+            df = pd.read_csv(data_path)
+        if "Label" not in df.columns:
+            logger.warning("Fallback training dataset missing Label column: %s", data_path)
+            return None
+        if not set(_DDOS_FEATURE_COLUMNS).issubset(set(df.columns)):
+            logger.warning("Fallback training dataset missing required DDoS feature columns: %s", data_path)
+            return None
+
+        y = df["Label"].apply(lambda x: 0 if str(x).strip().lower() == "benign" else 1)
+        x = df[_DDOS_FEATURE_COLUMNS]
+        trained_model = RandomForestClassifier(n_estimators=80, random_state=42)
+        trained_model.fit(x, y)
+        _DDOS_MODEL_TMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(trained_model, _DDOS_MODEL_TMP_PATH)
+        logger.info(
+            "Trained fallback DDoS model from %s and cached to %s",
+            data_path,
+            _DDOS_MODEL_TMP_PATH,
+        )
+        return trained_model
+    except Exception as exc:
+        logger.warning("Fallback DDoS training failed: %s", exc)
+        return None
 
 
 def _ensure_ddos_model_loaded():
-    """Load DDoS model from local artifact, or download once at runtime."""
-    global model
+    """Load DDoS model from local artifact, URL, or train fallback once."""
+    global model, _DDOS_MODEL_SOURCE
     if model is not None:
         return model
 
@@ -695,29 +758,37 @@ def _ensure_ddos_model_loaded():
 
         if _dd_path.is_file():
             model = joblib.load(_dd_path)
+            _DDOS_MODEL_SOURCE = "model_path"
             return model
 
         if _DDOS_MODEL_TMP_PATH.is_file():
             model = joblib.load(_DDOS_MODEL_TMP_PATH)
+            _DDOS_MODEL_SOURCE = "tmp_cache"
             return model
 
-        if not _DDOS_MODEL_URL:
-            return None
-
-        try:
-            with urlopen(_DDOS_MODEL_URL, timeout=_DDOS_MODEL_DOWNLOAD_TIMEOUT_SEC) as response:
-                payload = response.read()
-            if not payload:
+        if _DDOS_MODEL_URL:
+            try:
+                with urlopen(_DDOS_MODEL_URL, timeout=_DDOS_MODEL_DOWNLOAD_TIMEOUT_SEC) as response:
+                    payload = response.read()
+                if payload:
+                    _DDOS_MODEL_TMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    _DDOS_MODEL_TMP_PATH.write_bytes(payload)
+                    model = joblib.load(_DDOS_MODEL_TMP_PATH)
+                    _DDOS_MODEL_SOURCE = "ddos_model_url"
+                    logger.info(
+                        "Loaded DDoS model from DDOS_MODEL_URL into %s",
+                        _DDOS_MODEL_TMP_PATH,
+                    )
+                    return model
                 logger.warning("DDOS_MODEL_URL returned empty payload")
-                return None
-            _DDOS_MODEL_TMP_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _DDOS_MODEL_TMP_PATH.write_bytes(payload)
-            model = joblib.load(_DDOS_MODEL_TMP_PATH)
-            logger.info("Loaded DDoS model from DDOS_MODEL_URL into %s", _DDOS_MODEL_TMP_PATH)
+            except (URLError, OSError, ValueError, EOFError) as exc:
+                logger.warning("Failed loading DDoS model from DDOS_MODEL_URL: %s", exc)
+
+        model = _train_ddos_fallback_model()
+        if model is not None:
+            _DDOS_MODEL_SOURCE = "trained_fallback"
             return model
-        except (URLError, OSError, ValueError, EOFError) as exc:
-            logger.warning("Failed loading DDoS model from DDOS_MODEL_URL: %s", exc)
-            return None
+        return None
 
 
 def _ddos_model_debug_status() -> dict:
@@ -725,17 +796,14 @@ def _ddos_model_debug_status() -> dict:
     loaded_model = _ensure_ddos_model_loaded()
     return {
         "ddos_model_loaded": loaded_model is not None,
-        "loaded_from": (
-            "memory"
-            if loaded_model is not None and model is not None and _dd_path.is_file()
-            else "tmp_cache"
-            if loaded_model is not None and _DDOS_MODEL_TMP_PATH.is_file()
-            else None
-        ),
+        "loaded_from": _DDOS_MODEL_SOURCE,
         "model_path_exists": _dd_path.is_file(),
         "tmp_model_path_exists": _DDOS_MODEL_TMP_PATH.is_file(),
         "ddos_model_url_configured": bool(_DDOS_MODEL_URL),
         "ddos_model_url": _DDOS_MODEL_URL if _DDOS_MODEL_URL else None,
+        "fallback_dataset_exists": any(
+            p.is_file() for p in (_MODEL_DIR / "ddos_dataset.xlsx", _MODEL_DIR / "ddos.csv")
+        ),
     }
 
 # load brute-force model and encoders if present
