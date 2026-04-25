@@ -96,6 +96,13 @@ _OPENAPI_TAGS = [
     },
 ]
 
+_AUTH_OPENAPI_TAGS = [
+    {
+        "name": "Authentication",
+        "description": "Login endpoint backed by MongoDB `users` collection.",
+    },
+]
+
 app = FastAPI(
     title="SOC Security API",
     version="1.0.0",
@@ -128,6 +135,13 @@ optional **MongoDB** persistence, **Redis** pub/sub for realtime dashboards, and
 | *(local)* | Copy `.env.example` → `.env`; variables are loaded automatically via `python-dotenv`. |
 """,
     openapi_tags=_OPENAPI_TAGS,
+)
+
+auth_app = FastAPI(
+    title="SOC Authentication API",
+    version="1.0.0",
+    description="Authentication endpoints only.",
+    openapi_tags=_AUTH_OPENAPI_TAGS,
 )
 
 _cors_origins = os.getenv("CORS_ORIGINS", "*").strip()
@@ -203,6 +217,7 @@ db = None
 devices_collection = None
 alerts_collection = None
 actions_collection = None
+users_collection = None
 try:
     mongo_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=10000)
     mongo_client.admin.command("ping")
@@ -210,6 +225,7 @@ try:
     devices_collection = db["devices"]
     alerts_collection = db["alerts"]
     actions_collection = db["automated_actions"]
+    users_collection = db["users"]
     MONGO_LAST_ERROR = None
     logger.info("MongoDB connected successfully: %s/%s", MONGO_URL, MONGO_DB)
 except Exception as exc:
@@ -231,12 +247,25 @@ def initialize_mongo() -> None:
         return
     now = datetime.utcnow().isoformat()
     existing = set(db.list_collection_names())
-    for name in ["devices", "alerts", "automated_actions", "app_meta"]:
+    for name in ["devices", "alerts", "automated_actions", "users", "app_meta"]:
         if name not in existing:
             db.create_collection(name)
     db["app_meta"].update_one(
         {"_id": "bootstrap"},
         {"$set": {"initialized_at": now}},
+        upsert=True,
+    )
+    db["users"].update_one(
+        {"email": "admin@admin.com"},
+        {
+            "$setOnInsert": {
+                "email": "admin@admin.com",
+                "password": "admin",
+                "role": "admin",
+                "created_at": now,
+            },
+            "$set": {"updated_at": now},
+        },
         upsert=True,
     )
 
@@ -822,6 +851,11 @@ class AutomatedActionCreate(BaseModel):
     alert_id: Optional[str] = None
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
 @app.get(
     "/actions/blocked-ips",
     tags=["Actions"],
@@ -1275,6 +1309,7 @@ def root(request: Request):
     return {
         "message": "DDoS and Brute-force Detection API Running",
         "docs": f"{base}/docs",
+        "auth_docs": f"{base}/auth/docs",
         "redoc": f"{base}/redoc",
         "openapi_json": f"{base}/openapi.json",
         "health_db": f"{base}/health/db",
@@ -1282,6 +1317,35 @@ def root(request: Request):
         "health_accuracy": f"{base}/health/accuracy",
         "health_models": f"{base}/health/models",
     }
+
+
+@auth_app.post(
+    "/login",
+    tags=["Authentication"],
+    summary="Login",
+    description=(
+        "Validates `email` and `password` against MongoDB `users` collection. "
+        "Seeded admin user: `admin@admin.com` / `admin`."
+    ),
+)
+def login(payload: LoginRequest):
+    if users_collection is None:
+        return {"error": "MongoDB is not connected"}
+
+    user_doc = users_collection.find_one({"email": payload.email})
+    if user_doc is None or user_doc.get("password") != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    return {
+        "message": "Login successful",
+        "user": {
+            "email": user_doc.get("email"),
+            "role": user_doc.get("role", "user"),
+        },
+    }
+
+
+app.mount("/auth", auth_app)
 
 
 @app.get(
