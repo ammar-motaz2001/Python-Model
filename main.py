@@ -811,10 +811,106 @@ model_bruteforce = None
 username_encoder = None
 ip_encoder = None
 _bf_path = _MODEL_DIR / "model_bruteforce.pkl"
-if _bf_path.is_file():
-    model_bruteforce = joblib.load(_bf_path)
-    username_encoder = joblib.load(_MODEL_DIR / "username_encoder.pkl")
-    ip_encoder = joblib.load(_MODEL_DIR / "ip_encoder.pkl")
+_bf_username_encoder_path = _MODEL_DIR / "username_encoder.pkl"
+_bf_ip_encoder_path = _MODEL_DIR / "ip_encoder.pkl"
+_BF_MODEL_URL = os.getenv("BF_MODEL_URL", "").strip()
+_BF_USERNAME_ENCODER_URL = os.getenv("BF_USERNAME_ENCODER_URL", "").strip()
+_BF_IP_ENCODER_URL = os.getenv("BF_IP_ENCODER_URL", "").strip()
+_BF_MODEL_DOWNLOAD_TIMEOUT_SEC = float(os.getenv("BF_MODEL_DOWNLOAD_TIMEOUT_SEC", "20"))
+_BF_MODEL_TMP_PATH = Path("/tmp/model_bruteforce.pkl")
+_BF_USERNAME_ENCODER_TMP_PATH = Path("/tmp/username_encoder.pkl")
+_BF_IP_ENCODER_TMP_PATH = Path("/tmp/ip_encoder.pkl")
+_BF_MODEL_SOURCE: Optional[str] = None
+
+
+def _try_download_to_tmp(url: str, tmp_path: Path, kind: str) -> bool:
+    if not url:
+        return False
+    try:
+        with urlopen(url, timeout=_BF_MODEL_DOWNLOAD_TIMEOUT_SEC) as response:
+            payload = response.read()
+        if not payload:
+            logger.warning("%s URL returned empty payload", kind)
+            return False
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_bytes(payload)
+        return True
+    except (URLError, OSError) as exc:
+        logger.warning("Failed downloading %s from URL: %s", kind, exc)
+        return False
+
+
+def _ensure_bruteforce_artifacts_loaded():
+    """Load brute-force model + encoders from local artifacts or URLs."""
+    global model_bruteforce, username_encoder, ip_encoder, _BF_MODEL_SOURCE
+    if model_bruteforce is not None and username_encoder is not None and ip_encoder is not None:
+        return model_bruteforce, username_encoder, ip_encoder
+
+    with _MODEL_LOAD_LOCK:
+        if model_bruteforce is not None and username_encoder is not None and ip_encoder is not None:
+            return model_bruteforce, username_encoder, ip_encoder
+
+        if _bf_path.is_file() and _bf_username_encoder_path.is_file() and _bf_ip_encoder_path.is_file():
+            model_bruteforce = joblib.load(_bf_path)
+            username_encoder = joblib.load(_bf_username_encoder_path)
+            ip_encoder = joblib.load(_bf_ip_encoder_path)
+            _BF_MODEL_SOURCE = "model_path"
+            return model_bruteforce, username_encoder, ip_encoder
+
+        if (
+            _BF_MODEL_TMP_PATH.is_file()
+            and _BF_USERNAME_ENCODER_TMP_PATH.is_file()
+            and _BF_IP_ENCODER_TMP_PATH.is_file()
+        ):
+            model_bruteforce = joblib.load(_BF_MODEL_TMP_PATH)
+            username_encoder = joblib.load(_BF_USERNAME_ENCODER_TMP_PATH)
+            ip_encoder = joblib.load(_BF_IP_ENCODER_TMP_PATH)
+            _BF_MODEL_SOURCE = "tmp_cache"
+            return model_bruteforce, username_encoder, ip_encoder
+
+        downloaded_any = False
+        downloaded_any = _try_download_to_tmp(_BF_MODEL_URL, _BF_MODEL_TMP_PATH, "BF_MODEL_URL") or downloaded_any
+        downloaded_any = (
+            _try_download_to_tmp(
+                _BF_USERNAME_ENCODER_URL,
+                _BF_USERNAME_ENCODER_TMP_PATH,
+                "BF_USERNAME_ENCODER_URL",
+            )
+            or downloaded_any
+        )
+        downloaded_any = _try_download_to_tmp(_BF_IP_ENCODER_URL, _BF_IP_ENCODER_TMP_PATH, "BF_IP_ENCODER_URL") or downloaded_any
+        if downloaded_any:
+            if (
+                _BF_MODEL_TMP_PATH.is_file()
+                and _BF_USERNAME_ENCODER_TMP_PATH.is_file()
+                and _BF_IP_ENCODER_TMP_PATH.is_file()
+            ):
+                model_bruteforce = joblib.load(_BF_MODEL_TMP_PATH)
+                username_encoder = joblib.load(_BF_USERNAME_ENCODER_TMP_PATH)
+                ip_encoder = joblib.load(_BF_IP_ENCODER_TMP_PATH)
+                _BF_MODEL_SOURCE = "url_download"
+                return model_bruteforce, username_encoder, ip_encoder
+
+        return None, None, None
+
+
+def _bruteforce_model_debug_status() -> dict:
+    loaded_model, loaded_username_encoder, loaded_ip_encoder = _ensure_bruteforce_artifacts_loaded()
+    return {
+        "bruteforce_model_loaded": loaded_model is not None,
+        "username_encoder_loaded": loaded_username_encoder is not None,
+        "ip_encoder_loaded": loaded_ip_encoder is not None,
+        "loaded_from": _BF_MODEL_SOURCE,
+        "model_path_exists": _bf_path.is_file(),
+        "username_encoder_path_exists": _bf_username_encoder_path.is_file(),
+        "ip_encoder_path_exists": _bf_ip_encoder_path.is_file(),
+        "tmp_model_path_exists": _BF_MODEL_TMP_PATH.is_file(),
+        "tmp_username_encoder_path_exists": _BF_USERNAME_ENCODER_TMP_PATH.is_file(),
+        "tmp_ip_encoder_path_exists": _BF_IP_ENCODER_TMP_PATH.is_file(),
+        "bf_model_url_configured": bool(_BF_MODEL_URL),
+        "bf_username_encoder_url_configured": bool(_BF_USERNAME_ENCODER_URL),
+        "bf_ip_encoder_url_configured": bool(_BF_IP_ENCODER_URL),
+    }
 
 
 def _load_model_metrics_file() -> dict:
@@ -1664,6 +1760,19 @@ def health_model_ddos():
 
 
 @app.get(
+    "/health/model-bruteforce",
+    tags=["Core"],
+    summary="Brute-force model availability debug",
+    description=(
+        "Returns whether brute-force model and encoder artifacts are loaded "
+        "and where they were loaded from."
+    ),
+)
+def health_model_bruteforce():
+    return _bruteforce_model_debug_status()
+
+
+@app.get(
     "/health/models",
     tags=["Core"],
     summary="Combined model accuracy (alias)",
@@ -2076,22 +2185,24 @@ def detect_bruteforce_from_payload(
     device_doc: Optional[dict],
 ) -> dict:
     """Brute-force model path (same outputs as POST /detect for BF JSON)."""
-    if model_bruteforce is None:
+    loaded_bf_model, loaded_username_encoder, loaded_ip_encoder = _ensure_bruteforce_artifacts_loaded()
+    if loaded_bf_model is None or loaded_username_encoder is None or loaded_ip_encoder is None:
         raise HTTPException(
             status_code=503,
             detail=(
                 "Brute-force model is not available. Add model_bruteforce.pkl and encoder "
-                "files to deployment artifact or download them at runtime."
+                "files to deployment artifact, or set BF_MODEL_URL, BF_USERNAME_ENCODER_URL, "
+                "and BF_IP_ENCODER_URL to downloadable files."
             ),
         )
 
     try:
-        u = username_encoder.transform([payload.username])[0]
+        u = loaded_username_encoder.transform([payload.username])[0]
     except (ValueError, TypeError):
         u = 0
 
     try:
-        ip_enc = ip_encoder.transform([payload.foreign_ip])[0]
+        ip_enc = loaded_ip_encoder.transform([payload.foreign_ip])[0]
     except (ValueError, TypeError):
         ip_enc = 0
 
@@ -2104,7 +2215,7 @@ def detect_bruteforce_from_payload(
     ]])
 
     try:
-        prediction = model_bruteforce.predict(features)[0]
+        prediction = loaded_bf_model.predict(features)[0]
     except Exception as exc:
         logger.exception("Brute-force model.predict failed")
         raise HTTPException(
