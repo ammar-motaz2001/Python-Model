@@ -922,9 +922,11 @@ def _get_attempt_counter(collection, ip: str, threshold: int) -> dict:
         raise HTTPException(status_code=503, detail="MongoDB is not connected")
     doc = collection.find_one({"ip": ip}) or {}
     count = int(doc.get("count", 0))
-    is_blocked = bool(count >= threshold or ip in BLOCKED_IPS)
+    is_blocked = count >= threshold if count > 0 else False
     if is_blocked:
         persist_device_is_blocked(ip, True)
+    elif count == 0:
+        persist_device_is_blocked(ip, False)
     return {
         "count": count,
         "is_blocked": is_blocked,
